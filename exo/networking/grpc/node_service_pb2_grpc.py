@@ -5,7 +5,7 @@ import warnings
 
 from . import node_service_pb2 as node__service__pb2
 
-GRPC_GENERATED_VERSION = '1.67.0'
+GRPC_GENERATED_VERSION = '1.70.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -69,6 +69,11 @@ class NodeServiceStub(object):
                 request_serializer=node__service__pb2.HealthCheckRequest.SerializeToString,
                 response_deserializer=node__service__pb2.HealthCheckResponse.FromString,
                 _registered_method=True)
+        self.CallMCPTool = channel.unary_unary(
+                '/node_service.NodeService/CallMCPTool',
+                request_serializer=node__service__pb2.CallMCPToolRequest.SerializeToString,
+                response_deserializer=node__service__pb2.CallMCPToolResponse.FromString,
+                _registered_method=True)
 
 
 class NodeServiceServicer(object):
@@ -116,6 +121,12 @@ class NodeServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CallMCPTool(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NodeServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -153,6 +164,11 @@ def add_NodeServiceServicer_to_server(servicer, server):
                     servicer.HealthCheck,
                     request_deserializer=node__service__pb2.HealthCheckRequest.FromString,
                     response_serializer=node__service__pb2.HealthCheckResponse.SerializeToString,
+            ),
+            'CallMCPTool': grpc.unary_unary_rpc_method_handler(
+                    servicer.CallMCPTool,
+                    request_deserializer=node__service__pb2.CallMCPToolRequest.FromString,
+                    response_serializer=node__service__pb2.CallMCPToolResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -344,6 +360,33 @@ class NodeService(object):
             '/node_service.NodeService/HealthCheck',
             node__service__pb2.HealthCheckRequest.SerializeToString,
             node__service__pb2.HealthCheckResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CallMCPTool(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/node_service.NodeService/CallMCPTool',
+            node__service__pb2.CallMCPToolRequest.SerializeToString,
+            node__service__pb2.CallMCPToolResponse.FromString,
             options,
             channel_credentials,
             insecure,

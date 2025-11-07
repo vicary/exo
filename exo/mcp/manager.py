@@ -83,12 +83,13 @@ class MCPConfigWatcher(FileSystemEventHandler):
 class MCPServerManager:
     """Manages MCP server lifecycles and watches for config changes."""
     
-    def __init__(self, config_path: Optional[str] = None, topology_viz: Optional[Any] = None):
+    def __init__(self, config_path: Optional[str] = None, topology_viz: Optional[Any] = None, node: Optional[Any] = None):
         self.config_path = Path(config_path or "mcp.json").expanduser().resolve()
         self.clients: Dict[str, MCPClient] = {}
         self.observer: Optional[Observer] = None
         self._reload_lock = asyncio.Lock()
         self.topology_viz = topology_viz
+        self.node = node  # Reference to Node for broadcasting availability
         # Unified server info: server_name -> {status, error, tools_count, config, active_config}
         # - status: "connecting", "connected", "error"
         # - error: error message if status is "error"
@@ -100,6 +101,7 @@ class MCPServerManager:
         self._connection_tasks: Dict[str, asyncio.Task] = {}  # server_name -> in-progress connection task
         self._connection_lock = asyncio.Lock()  # Lock for protecting _connection_tasks dictionary
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None  # Store event loop for file watcher
+        self._last_broadcasted_servers: Dict[str, Dict[str, Any]] = {}  # Track last broadcasted server states
         
     async def start(self) -> None:
         """Start the MCP manager and watch for config changes."""
@@ -239,6 +241,9 @@ class MCPServerManager:
             except Exception as e:
                 if DEBUG >= 1:
                     print(f"[MCP] Error reloading config: {e}")
+            finally:
+                # Always broadcast availability after reload attempt, even on error
+                await self._broadcast_availability_if_changed()
     
     def _config_changed(self, name: str, new_config: Dict[str, Any]) -> bool:
         """Check if server config has changed by comparing relevant fields."""
@@ -429,6 +434,9 @@ class MCPServerManager:
                 self._servers[name]["active_config"] = config.copy()
             self._update_tui()
             
+            # Broadcast MCP availability if we have connected servers
+            await self._broadcast_availability_if_changed()
+            
             if DEBUG >= 1:
                 print(f"[MCP] Connected to server: {name}")
                 
@@ -482,11 +490,41 @@ class MCPServerManager:
         # Remove server info
         self._servers.pop(name, None)
         self._update_tui()
+        
+        # Broadcast MCP availability if changed
+        await self._broadcast_availability_if_changed()
     
     async def _disconnect_all(self) -> None:
         """Disconnect all clients."""
         for name in list(self.clients.keys()):
             await self._disconnect_client(name)
+        # Broadcast that we no longer have MCP servers
+        await self._broadcast_availability_if_changed()
+    
+    async def _broadcast_availability_if_changed(self) -> None:
+        """Broadcast MCP server statuses if they have changed."""
+        if not self.node:
+            return
+        
+        # Build current server statuses
+        current_servers = {}
+        for name, info in self._servers.items():
+            current_servers[name] = {
+                "status": info.get("status", "unknown"),
+                "error": info.get("error"),
+                "tools_count": info.get("tools_count", 0)
+            }
+        
+        # Check if status has changed
+        if current_servers != self._last_broadcasted_servers:
+            self._last_broadcasted_servers = current_servers.copy()
+            try:
+                await self.node.broadcast_mcp_status(current_servers)
+                if DEBUG >= 1:
+                    print(f"[MCP] Broadcasted MCP status for {len(current_servers)} server(s)")
+            except Exception as e:
+                if DEBUG >= 1:
+                    print(f"[MCP] Error broadcasting MCP status: {e}")
     
     def get_all_tools(self) -> List[Dict[str, Any]]:
         """Get all tools from all connected MCP servers."""

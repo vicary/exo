@@ -202,6 +202,19 @@ class GRPCPeerHandle(PeerHandle):
     await self._ensure_connected()
     request = node_service_pb2.SendOpaqueStatusRequest(request_id=request_id, status=status)
     await asyncio.wait_for(self.stub.SendOpaqueStatus(request), timeout=10.0)
+  
+  async def call_mcp_tool(self, tool_name: str, arguments: dict) -> dict:
+    """Call an MCP tool on a remote node."""
+    await self._ensure_connected()
+    import json
+    arguments_json = json.dumps(arguments) if arguments else "{}"
+    request = node_service_pb2.CallMCPToolRequest(tool_name=tool_name, arguments_json=arguments_json)
+    response = await asyncio.wait_for(self.stub.CallMCPTool(request), timeout=30.0)
+    
+    if not response.success:
+      raise Exception(f"MCP tool call failed on {self._id}: {response.error}")
+    
+    return json.loads(response.result_json) if response.result_json else {}
 
   def serialize_inference_state(self, inference_state: dict) -> node_service_pb2.InferenceState:
     proto_inference_state = node_service_pb2.InferenceState()

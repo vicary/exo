@@ -744,7 +744,55 @@ document.addEventListener("alpine:init", () => {
         const response = await fetch(`${window.location.origin}/mcp/status`);
         if (response.ok) {
           const data = await response.json();
-          this.mcpServers = data.servers || {};
+          const rawServers = data.servers || {};
+          
+          // Group servers by name, handling both local and remote servers
+          const groupedServers = {};
+          
+          for (const [key, serverInfo] of Object.entries(rawServers)) {
+            // Parse key: either "server_name" (local) or "server_name@node_id" (remote)
+            let serverName, nodeId;
+            if (key.includes('@')) {
+              const parts = key.split('@');
+              serverName = parts[0];
+              nodeId = parts.slice(1).join('@'); // In case node_id contains @
+            } else {
+              serverName = key;
+              nodeId = serverInfo.node_id || null;
+            }
+            
+            // Group by server name
+            if (!groupedServers[serverName]) {
+              groupedServers[serverName] = {
+                status: serverInfo.status,
+                error: serverInfo.error,
+                tools_count: serverInfo.tools_count,
+                tools: serverInfo.tools || [],
+                instances: [] // Track all instances (local + remote)
+              };
+            }
+            
+            // Add this instance
+            groupedServers[serverName].instances.push({
+              node_id: nodeId,
+              is_local: serverInfo.is_local || false,
+              status: serverInfo.status,
+              error: serverInfo.error,
+              tools_count: serverInfo.tools_count
+            });
+            
+            // Merge tools (prefer local tools if available)
+            if (serverInfo.is_local && serverInfo.tools) {
+              groupedServers[serverName].tools = serverInfo.tools;
+            }
+            
+            // Update overall status (prefer connected if any instance is connected)
+            if (serverInfo.status === 'connected' && groupedServers[serverName].status !== 'connected') {
+              groupedServers[serverName].status = 'connected';
+            }
+          }
+          
+          this.mcpServers = groupedServers;
         }
       } catch (error) {
         console.error('Error fetching MCP status:', error);

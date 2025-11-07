@@ -148,7 +148,21 @@
           <div class="model-group">
             <div class="model-group-header" @click="toggleGroup(mainPrefix)">
               <div class="group-header-content">
-                <span x-text="mainPrefix" style="margin-right: auto;"></span>
+                <div style="display: flex; flex-direction: column; align-items: flex-start; flex: 1;">
+                  <span x-text="mainPrefix" style="font-weight: bold;"></span>
+                  <template x-if="subGroup.instances && subGroup.instances.filter(i => !i.is_local).length > 0">
+                    <div style="font-size: 0.75rem; color: #888; margin-top: 2px;">
+                      <template x-for="instance in subGroup.instances.filter(i => !i.is_local)" :key="instance.node_id">
+                        <span>
+                          <span x-text="`@${instance.node_id}`" style="color: #2196F3;"></span>
+                          <template x-if="subGroup.instances.filter(i => !i.is_local).indexOf(instance) < subGroup.instances.filter(i => !i.is_local).length - 1">
+                            <span>, </span>
+                          </template>
+                        </span>
+                      </template>
+                    </div>
+                  </template>
+                </div>
 
                 <span class="model-badge" :class="{
                   'status-success': subGroup.status === 'connected',

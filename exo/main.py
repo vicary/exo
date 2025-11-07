@@ -167,7 +167,8 @@ node.server = server
 
 # Initialize MCP manager
 from exo.mcp import MCPServerManager
-mcp_manager = MCPServerManager(topology_viz=topology_viz)
+mcp_manager = MCPServerManager(topology_viz=topology_viz, node=node)
+node.mcp_manager = mcp_manager  # Store reference in node for RPC access
 
 api = ChatGPTAPI(
   node,

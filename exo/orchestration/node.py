@@ -4,7 +4,7 @@ import asyncio
 import uuid
 import time
 import traceback
-from typing import List, Dict, Optional, Tuple, Union, Set
+from typing import List, Dict, Optional, Tuple, Any
 from exo.networking import Discovery, PeerHandle, Server
 from exo.inference.inference_engine import InferenceEngine, Shard
 from exo.topology.topology import Topology
@@ -54,6 +54,9 @@ class Node:
     self.node_download_progress: Dict[str, RepoProgressEvent] = {}
     self.topology_inference_engines_pool: List[List[str]] = []
     self.outstanding_requests = {}
+    self.remote_mcp_servers: Dict[str, Dict[str, Dict[str, Any]]] = {}  # node_id -> {server_name: {status, error, tools_count}}
+    self.mcp_manager: Optional[Any] = None  # Reference to MCP manager (set externally)
+    self._mcp_load_balancer_counter: int = 0  # Counter for round-robin load balancing
 
   async def start(self, wait_for_peers: int = 0) -> None:
     self.device_capabilities = await device_capabilities()
@@ -82,6 +85,24 @@ class Node:
         elif status_data.get("status", "").startswith("end_"):
           if status_data.get("node_id") == self.current_topology.active_node_id:
             self.current_topology.active_node_id = None
+      elif status_type == "mcp_status":
+        node_id = status_data.get("node_id")
+        servers = status_data.get("servers", {})
+        
+        # Update remote MCP servers for this node
+        if node_id == self.id:
+          # This is our own status, skip (we track it locally)
+          pass
+        else:
+          # Store remote server statuses
+          if servers:
+            self.remote_mcp_servers[node_id] = servers
+          else:
+            # No servers means node has no MCP servers, remove it
+            self.remote_mcp_servers.pop(node_id, None)
+        
+        if DEBUG >= 2:
+          print(f"[Node] Updated MCP status for {node_id}: {len(servers)} server(s)")
 
       download_progress = None
       if status_type == "download_progress":
@@ -613,6 +634,15 @@ class Node:
     await asyncio.gather(*[send_status_to_peer(peer) for peer in self.peers], return_exceptions=True)
     # in the case of opaque status, we also want to receive our own opaque statuses
     self.on_opaque_status.trigger_all(request_id, status)
+  
+  async def broadcast_mcp_status(self, servers: Dict[str, Dict[str, Any]]) -> None:
+    """Broadcast MCP server statuses to all peers."""
+    status_message = json.dumps({
+      "type": "mcp_status",
+      "node_id": self.id,
+      "servers": servers
+    })
+    await self.broadcast_opaque_status("", status_message)
 
   @property
   def current_topology(self) -> Topology:

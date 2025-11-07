@@ -155,6 +155,48 @@ class GRPCServer(node_service_pb2_grpc.NodeServiceServicer):
 
   async def HealthCheck(self, request, context):
     return node_service_pb2.HealthCheckResponse(is_healthy=True)
+  
+  async def CallMCPTool(self, request, context):
+    """Handle remote MCP tool call requests."""
+    tool_name = request.tool_name
+    arguments_json = request.arguments_json
+    
+    try:
+      # Get MCP manager from node if available
+      if not hasattr(self.node, 'mcp_manager') or self.node.mcp_manager is None:
+        return node_service_pb2.CallMCPToolResponse(
+          result_json="",
+          success=False,
+          error="MCP manager not available on this node"
+        )
+      
+      mcp_manager = self.node.mcp_manager
+      
+      # Parse arguments
+      import json
+      arguments = json.loads(arguments_json) if arguments_json else {}
+      
+      # Call the tool
+      result = await mcp_manager.call_tool(tool_name, arguments)
+      
+      # Serialize result
+      result_json = json.dumps(result) if not isinstance(result, str) else result
+      
+      return node_service_pb2.CallMCPToolResponse(
+        result_json=result_json,
+        success=True,
+        error=None
+      )
+    except Exception as e:
+      if DEBUG >= 1:
+        print(f"[GRPCServer] Error calling MCP tool {tool_name}: {e}")
+        import traceback
+        traceback.print_exc()
+      return node_service_pb2.CallMCPToolResponse(
+        result_json="",
+        success=False,
+        error=str(e)
+      )
 
   def deserialize_inference_state(self, inference_state_proto: node_service_pb2.InferenceState) -> dict:
     inference_state = {}

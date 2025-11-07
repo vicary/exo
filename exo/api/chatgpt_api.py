@@ -228,8 +228,13 @@ def get_tool_handling_strategy(tool_calls: List[Dict], client_tools: Optional[Li
     return "none", []
 
 
-async def execute_tool_calls(tool_calls: List[Dict], mcp_manager: Optional[Any]) -> List[Dict]:
-  """Execute MCP tool calls server-side and return tool results."""
+async def execute_tool_calls(tool_calls: List[Dict], mcp_manager: Optional[Any], node: Optional[Any] = None) -> List[Dict]:
+  """
+  Execute MCP tool calls server-side and return tool results.
+  
+  If node is provided, routes tool calls to nodes with MCP servers using load balancing.
+  Otherwise, executes locally if mcp_manager is available.
+  """
   tool_results = []
   for tool_call in tool_calls:
     tool_name = tool_call["function"]["name"]
@@ -239,18 +244,63 @@ async def execute_tool_calls(tool_calls: List[Dict], mcp_manager: Optional[Any])
       arguments = tool_call["function"]["arguments"] if isinstance(tool_call["function"]["arguments"], dict) else {}
     
     try:
-      result = await mcp_manager.call_tool(tool_name, arguments)
+      # Parse tool name to get server name: mcp_{server}_{tool}
+      if not tool_name.startswith("mcp_"):
+        raise Exception(f"Invalid MCP tool name format: {tool_name}")
+      
+      parts = tool_name.split("_", 2)
+      if len(parts) < 3:
+        raise Exception(f"Invalid MCP tool name format: {tool_name}")
+      
+      server_name = parts[1]
+      result = None
+      
+      # Check if we have this server locally
+      has_local = mcp_manager and server_name in mcp_manager.clients
+      
+      if has_local:
+        # Execute locally if we have the server
+        result = await mcp_manager.call_tool(tool_name, arguments)
+        if DEBUG >= 1:
+          print(f"[ChatGPTAPI] Executed MCP tool {tool_name} locally on server {server_name}")
+      elif node and hasattr(node, 'remote_mcp_servers'):
+        # Find nodes that have this server
+        available_nodes = []
+        for node_id, servers in node.remote_mcp_servers.items():
+          if server_name in servers:
+            server_info = servers[server_name]
+            # Only use connected servers
+            if server_info.get("status") == "connected":
+              available_nodes.append(node_id)
+        
+        if available_nodes:
+          # Use round-robin load balancing
+          node._mcp_load_balancer_counter = (node._mcp_load_balancer_counter + 1) % len(available_nodes)
+          target_node_id = available_nodes[node._mcp_load_balancer_counter]
+          target_peer = next((p for p in node.peers if p.id() == target_node_id), None)
+          
+          if target_peer:
+            if DEBUG >= 1:
+              print(f"[ChatGPTAPI] Routing MCP tool {tool_name} (server {server_name}) to node {target_node_id} (load balanced)")
+            result = await target_peer.call_mcp_tool(tool_name, arguments)
+          else:
+            raise Exception(f"No peer found for node {target_node_id} with server {server_name}")
+        else:
+          raise Exception(f"No nodes found with connected MCP server '{server_name}'")
+      else:
+        raise Exception(f"No MCP manager available and no remote nodes with server '{server_name}' found")
+      
       tool_results.append({
         "role": "tool",
         "tool_call_id": tool_call["id"],
         "name": tool_name,
         "content": json.dumps(result) if not isinstance(result, str) else result
       })
-      if DEBUG >= 1:
-        print(f"[ChatGPTAPI] Executed MCP tool {tool_name}: {result}")
     except Exception as e:
       if DEBUG >= 1:
         print(f"[ChatGPTAPI] Error executing MCP tool {tool_name}: {e}")
+        import traceback
+        traceback.print_exc()
       tool_results.append({
         "role": "tool",
         "tool_call_id": tool_call["id"],
@@ -675,7 +725,7 @@ class ChatGPTAPI:
               print(f"[ChatGPTAPI] Executing {len(mcp_tool_calls)} MCP tool call(s) server-side (streaming)")
             
             # Execute tool calls
-            tool_results = await execute_tool_calls(mcp_tool_calls, self.mcp_manager)
+            tool_results = await execute_tool_calls(mcp_tool_calls, self.mcp_manager, self.node)
             
             # Add messages for continuation
             assistant_msg_content = decoded_content.split("<tool_call>")[0].strip() if "<tool_call>" in decoded_content else decoded_content
@@ -785,7 +835,7 @@ class ChatGPTAPI:
             print(f"[ChatGPTAPI] Executing {len(mcp_tool_calls)} MCP tool call(s) server-side")
           
           # Execute tool calls
-          tool_results = await execute_tool_calls(mcp_tool_calls, self.mcp_manager)
+          tool_results = await execute_tool_calls(mcp_tool_calls, self.mcp_manager, self.node)
           
           # Add assistant message with tool calls and tool results to conversation
           assistant_msg_content = decoded_content.split("<tool_call>")[0].strip() if "<tool_call>" in decoded_content else decoded_content
@@ -1011,35 +1061,53 @@ class ChatGPTAPI:
       return web.json_response({"detail": f"Error getting topology: {str(e)}"}, status=500)
 
   async def handle_get_mcp_status(self, request):
-    """Get MCP server status and tools."""
+    """Get MCP server status and tools, including remote servers."""
     try:
-      if not self.mcp_manager:
-        return web.json_response({"servers": {}}, status=200)
-      
       servers_data = {}
-      # Get status for all servers (including failed ones)
-      for server_name, info in self.mcp_manager._servers.items():
-        server_info = {
-          "status": info.get("status", "unknown"),
-          "error": info.get("error"),
-          "tools_count": info.get("tools_count", 0)
-        }
-        
-        # Get tools if server is connected
-        if server_name in self.mcp_manager.clients:
-          client = self.mcp_manager.clients[server_name]
-          tools = []
-          for tool in client.tools:
-            tools.append({
-              "name": tool.get("name", ""),
-              "description": tool.get("description", ""),
-              "inputSchema": tool.get("inputSchema", {})
-            })
-          server_info["tools"] = tools
-        else:
-          server_info["tools"] = []
-        
-        servers_data[server_name] = server_info
+      
+      # Get local servers
+      if self.mcp_manager:
+        for server_name, info in self.mcp_manager._servers.items():
+          server_info = {
+            "status": info.get("status", "unknown"),
+            "error": info.get("error"),
+            "tools_count": info.get("tools_count", 0),
+            "node_id": self.node.id,  # Local servers have this node's ID
+            "is_local": True
+          }
+          
+          # Get tools if server is connected
+          if server_name in self.mcp_manager.clients:
+            client = self.mcp_manager.clients[server_name]
+            tools = []
+            for tool in client.tools:
+              tools.append({
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "inputSchema": tool.get("inputSchema", {})
+              })
+            server_info["tools"] = tools
+          else:
+            server_info["tools"] = []
+          
+          # Use server name as key (local servers)
+          servers_data[server_name] = server_info
+      
+      # Get remote servers
+      if hasattr(self.node, 'remote_mcp_servers'):
+        for node_id, remote_servers in self.node.remote_mcp_servers.items():
+          for server_name, server_info in remote_servers.items():
+            # Create a unique key for remote servers: "server_name@node_id"
+            remote_key = f"{server_name}@{node_id}"
+            remote_server_info = {
+              "status": server_info.get("status", "unknown"),
+              "error": server_info.get("error"),
+              "tools_count": server_info.get("tools_count", 0),
+              "node_id": node_id,
+              "is_local": False,
+              "tools": []  # Remote servers don't expose tools via this endpoint
+            }
+            servers_data[remote_key] = remote_server_info
       
       return web.json_response({"servers": servers_data}, status=200)
     except Exception as e:
