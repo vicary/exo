@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from typing import Dict, Optional, Any, List
 from watchdog.observers import Observer
@@ -17,14 +18,66 @@ class MCPConfigWatcher(FileSystemEventHandler):
     
     def __init__(self, manager):
         self.manager = manager
+        self._last_reload_time = 0
+        self._reload_debounce = 0.5  # Debounce rapid file changes
         
+    def _should_reload(self, event_path: str) -> bool:
+        """Check if we should reload based on the event path."""
+        # Normalize paths for comparison
+        event_path_normalized = str(Path(event_path).resolve())
+        config_path_normalized = str(self.manager.config_path.resolve())
+        
+        # Check if this is the config file we're watching
+        if event_path_normalized == config_path_normalized:
+            # Debounce rapid changes (some editors trigger multiple events)
+            current_time = time.time()
+            if current_time - self._last_reload_time < self._reload_debounce:
+                return False
+            self._last_reload_time = current_time
+            return True
+        return False
+    
+    def _schedule_reload(self):
+        """Schedule a config reload in the event loop."""
+        try:
+            # Use the stored event loop from the manager
+            loop = self.manager._event_loop
+            if loop and loop.is_running():
+                # Schedule the coroutine in the running event loop (from file watcher thread)
+                asyncio.run_coroutine_threadsafe(self.manager.reload_config(), loop)
+            else:
+                # Fallback: try to get current event loop
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(self.manager.reload_config(), loop)
+                    else:
+                        # Try to create task if we're in the same thread
+                        asyncio.create_task(self.manager.reload_config())
+                except RuntimeError:
+                    if DEBUG >= 1:
+                        print(f"[MCP] Could not schedule reload: no event loop available")
+        except Exception as e:
+            if DEBUG >= 1:
+                print(f"[MCP] Error scheduling reload: {e}")
+    
     def on_modified(self, event):
-        if event.src_path.endswith('mcp.json'):
-            asyncio.create_task(self.manager.reload_config())
+        if not event.is_directory and self._should_reload(event.src_path):
+            if DEBUG >= 1:
+                print(f"[MCP] Config file modified: {event.src_path}")
+            self._schedule_reload()
     
     def on_created(self, event):
-        if event.src_path.endswith('mcp.json'):
-            asyncio.create_task(self.manager.reload_config())
+        if not event.is_directory and self._should_reload(event.src_path):
+            if DEBUG >= 1:
+                print(f"[MCP] Config file created: {event.src_path}")
+            self._schedule_reload()
+    
+    def on_deleted(self, event):
+        if not event.is_directory and self._should_reload(event.src_path):
+            if DEBUG >= 1:
+                print(f"[MCP] Config file deleted: {event.src_path}")
+            self._schedule_reload()
 
 
 class MCPServerManager:
@@ -36,14 +89,23 @@ class MCPServerManager:
         self.observer: Optional[Observer] = None
         self._reload_lock = asyncio.Lock()
         self.topology_viz = topology_viz
-        self.server_status: Dict[str, Dict[str, Any]] = {}  # server_name -> {status, error, tools_count}
-        self._failed_configs: Dict[str, Dict[str, Any]] = {}  # server_name -> config (for retry)
+        # Unified server info: server_name -> {status, error, tools_count, config, active_config}
+        # - status: "connecting", "connected", "error"
+        # - error: error message if status is "error"
+        # - tools_count: number of tools available
+        # - config: latest config from file (for retry if failed)
+        # - active_config: config currently running (for change detection)
+        self._servers: Dict[str, Dict[str, Any]] = {}
         self._retry_task: Optional[asyncio.Task] = None
         self._connection_tasks: Dict[str, asyncio.Task] = {}  # server_name -> in-progress connection task
         self._connection_lock = asyncio.Lock()  # Lock for protecting _connection_tasks dictionary
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None  # Store event loop for file watcher
         
     async def start(self) -> None:
         """Start the MCP manager and watch for config changes."""
+        # Store event loop reference for file watcher callbacks
+        self._event_loop = asyncio.get_running_loop()
+        
         # Start file watcher
         self.observer = Observer()
         # Set as daemon thread so it doesn't prevent process exit
@@ -99,7 +161,7 @@ class MCPServerManager:
                     print(f"[MCP] Error disconnecting client {client.name}: {e}")
         
         self.clients.clear()
-        self.server_status.clear()
+        self._servers.clear()
     
     async def reload_config(self) -> None:
         """Reload MCP configuration from file."""
@@ -122,7 +184,7 @@ class MCPServerManager:
                 
                 # Find servers to remove
                 current_names = set(servers.keys())
-                existing_names = set(self.clients.keys()) | set(self.server_status.keys())
+                existing_names = set(self.clients.keys()) | set(self._servers.keys())
                 to_remove = existing_names - current_names
                 
                 # Disconnect removed servers
@@ -132,14 +194,20 @@ class MCPServerManager:
                     # Cancel any in-progress connection
                     await self._cancel_connection(name)
                     await self._disconnect_client(name)
-                    # Also remove from failed_configs if present
-                    self._failed_configs.pop(name, None)
                 
                 # Set status entries immediately for all servers in config (before connecting)
                 # This ensures the TUI panel shows up right away
                 for name in servers.keys():
-                    if name not in self.server_status:
-                        self.server_status[name] = {"status": "connecting", "error": None, "tools_count": 0}
+                    if name not in self._servers:
+                        self._servers[name] = {
+                            "status": "connecting",
+                            "error": None,
+                            "tools_count": 0,
+                            "config": None,
+                            "active_config": None
+                        }
+                    # Update config with latest from file
+                    self._servers[name]["config"] = servers[name].copy()
                 
                 # Update TUI immediately to show servers that are about to connect
                 self._update_tui()
@@ -150,12 +218,17 @@ class MCPServerManager:
                         # Check if config changed
                         if self._config_changed(name, server_config):
                             if DEBUG >= 1:
-                                print(f"[MCP] Updating server: {name}")
+                                print(f"[MCP] Config changed for server: {name}, reconnecting")
                             # Cancel any in-progress connection for this server
                             await self._cancel_connection(name)
                             await self._disconnect_client(name)
                             await self._connect_client(name, server_config)
+                        else:
+                            # Config unchanged, keep server running
+                            if DEBUG >= 2:
+                                print(f"[MCP] Config unchanged for server: {name}, keeping alive")
                     else:
+                        # New server or not yet connected
                         # Cancel any in-progress connection before starting new one
                         await self._cancel_connection(name)
                         await self._connect_client(name, server_config)
@@ -168,10 +241,47 @@ class MCPServerManager:
                     print(f"[MCP] Error reloading config: {e}")
     
     def _config_changed(self, name: str, new_config: Dict[str, Any]) -> bool:
-        """Check if server config has changed."""
-        # Simple comparison - in production, might want more sophisticated diffing
-        # For now, we'll just reconnect if the config exists
-        return True  # Always reconnect for simplicity
+        """Check if server config has changed by comparing relevant fields."""
+        # Get the current active config for this server
+        server_info = self._servers.get(name)
+        if not server_info:
+            return True
+        old_config = server_info.get("active_config")
+        
+        # If no old config exists, consider it changed (new server)
+        if old_config is None:
+            return True
+        
+        # Compare relevant fields that would require a restart
+        # For stdio transports: command, args, env
+        # For HTTP/SSE transports: url, headers
+        
+        if "command" in new_config:
+            # Stdio transport
+            if old_config.get("command") != new_config.get("command"):
+                return True
+            if old_config.get("args", []) != new_config.get("args", []):
+                return True
+            # Compare env dicts
+            old_env = old_config.get("env", {})
+            new_env = new_config.get("env", {})
+            if old_env != new_env:
+                return True
+        elif "url" in new_config:
+            # HTTP/SSE transport
+            if old_config.get("url") != new_config.get("url"):
+                return True
+            # Compare headers dicts
+            old_headers = old_config.get("headers", {})
+            new_headers = new_config.get("headers", {})
+            if old_headers != new_headers:
+                return True
+        else:
+            # Config structure changed (no command or url), consider it changed
+            return True
+        
+        # No relevant changes detected, keep server running
+        return False
     
     async def _cancel_connection(self, name: str) -> None:
         """Cancel any in-progress connection attempt for a server."""
@@ -240,13 +350,35 @@ class MCPServerManager:
     
     def _set_error_status(self, name: str, error_msg: str, config: Dict[str, Any]) -> None:
         """Set error status for a server and store config for retry."""
-        self.server_status[name] = {"status": "error", "error": error_msg, "tools_count": 0}
-        self._failed_configs[name] = config
+        if name not in self._servers:
+            self._servers[name] = {
+                "status": "error",
+                "error": error_msg,
+                "tools_count": 0,
+                "config": config.copy(),
+                "active_config": None
+            }
+        else:
+            self._servers[name]["status"] = "error"
+            self._servers[name]["error"] = error_msg
+            self._servers[name]["tools_count"] = 0
+            self._servers[name]["config"] = config.copy()
         self._update_tui()
     
     async def _connect_client_impl(self, name: str, config: Dict[str, Any]) -> None:
         """Internal implementation of client connection."""
-        self.server_status[name] = {"status": "connecting", "error": None, "tools_count": 0}
+        if name not in self._servers:
+            self._servers[name] = {
+                "status": "connecting",
+                "error": None,
+                "tools_count": 0,
+                "config": config.copy(),
+                "active_config": None
+            }
+        else:
+            self._servers[name]["status"] = "connecting"
+            self._servers[name]["error"] = None
+            self._servers[name]["config"] = config.copy()
         self._update_tui()
         
         transport = None
@@ -257,7 +389,11 @@ class MCPServerManager:
             
             # Determine transport type
             if "command" in config:
-                transport = StdioTransport(config["command"], config.get("args", []), config.get("env", {}))
+                transport = StdioTransport(
+                    config["command"], 
+                    config.get("args", []), 
+                    config.get("env", {})
+                )
             elif "url" in config:
                 url, headers = config["url"], config.get("headers", {})
 
@@ -266,7 +402,8 @@ class MCPServerManager:
                 else:
                     transport = HTTPTransport(url, headers)
             else:
-                self._set_error_status(name, "Invalid server config: missing 'command' or 'url'", config)
+                error_msg = "Invalid server config: missing 'command' or 'url'"
+                self._set_error_status(name, error_msg, config)
                 
                 if DEBUG >= 1:
                     print(f"[MCP] Invalid server config for {name}: {error_msg}")
@@ -276,10 +413,20 @@ class MCPServerManager:
             self.clients[name] = MCPClient(name, transport)
             await self.clients[name].initialize()
 
-            # Update status
-            self.server_status[name] = {"status": "connected", "error": None, "tools_count": len(self.clients[name].tools)}
-            # Remove from failed configs on success
-            self._failed_configs.pop(name, None)
+            # Update status to connected
+            if name not in self._servers:
+                self._servers[name] = {
+                    "status": "connected",
+                    "error": None,
+                    "tools_count": len(self.clients[name].tools),
+                    "config": config.copy(),
+                    "active_config": config.copy()
+                }
+            else:
+                self._servers[name]["status"] = "connected"
+                self._servers[name]["error"] = None
+                self._servers[name]["tools_count"] = len(self.clients[name].tools)
+                self._servers[name]["active_config"] = config.copy()
             self._update_tui()
             
             if DEBUG >= 1:
@@ -292,10 +439,32 @@ class MCPServerManager:
             raise
         except (MCPClientError, Exception) as e:
             await self._cleanup_transport(transport)
-            error_msg = str(e) if isinstance(e, MCPClientError) else f"Unexpected error: {str(e)}"
+            # Extract the actual error message, removing redundant prefixes
+            if isinstance(e, MCPClientError):
+                error_msg = str(e)
+                # Remove redundant "Failed to initialize MCP client" prefix if present
+                if error_msg.startswith("Failed to initialize MCP client "):
+                    error_msg = error_msg[len("Failed to initialize MCP client "):]
+            else:
+                error_msg = f"Unexpected error: {str(e)}"
+            
+            # Add server-specific context to make errors more identifiable
+            # Include command/url info if available
+            if transport and hasattr(transport, 'command'):
+                error_msg = f"{error_msg} (command: {transport.command})"
+            elif transport and hasattr(transport, 'url'):
+                error_msg = f"{error_msg} (url: {transport.url})"
+            elif config:
+                # Fallback to config info if transport wasn't created
+                if "command" in config:
+                    cmd_info = f"{config['command']} {' '.join(config.get('args', []))}"
+                    error_msg = f"{error_msg} (command: {cmd_info})"
+                elif "url" in config:
+                    error_msg = f"{error_msg} (url: {config['url']})"
+            
             self._set_error_status(name, error_msg, config)
             if DEBUG >= 1:
-                print(f"[MCP] Failed to connect to server {name}: {e}")
+                print(f"[MCP] Failed to connect to server {name}: {error_msg}")
     
     async def _disconnect_client(self, name: str) -> None:
         """Disconnect an MCP client."""
@@ -310,10 +479,9 @@ class MCPServerManager:
                 if DEBUG >= 1:
                     print(f"[MCP] Error disconnecting {name}: {e}")
         
-        # Remove status
-        if name in self.server_status:
-            del self.server_status[name]
-            self._update_tui()
+        # Remove server info
+        self._servers.pop(name, None)
+        self._update_tui()
     
     async def _disconnect_all(self) -> None:
         """Disconnect all clients."""
@@ -360,24 +528,24 @@ class MCPServerManager:
         try:
             result = await client.call_tool(actual_tool_name, arguments)
             # Clear any previous errors for this server
-            if server_name in self.server_status:
-                if self.server_status[server_name]["status"] == "error":
-                    self.server_status[server_name]["status"] = "connected"
-                    self.server_status[server_name]["error"] = None
+            if server_name in self._servers:
+                if self._servers[server_name]["status"] == "error":
+                    self._servers[server_name]["status"] = "connected"
+                    self._servers[server_name]["error"] = None
                     self._update_tui()
             return result
         except MCPClientError as e:
             error_msg = f"Tool call failed on {server_name}: {str(e)}"
-            if server_name in self.server_status:
-                self.server_status[server_name]["status"] = "error"
-                self.server_status[server_name]["error"] = error_msg
+            if server_name in self._servers:
+                self._servers[server_name]["status"] = "error"
+                self._servers[server_name]["error"] = error_msg
             self._update_tui_error(error_msg)
             raise
         except Exception as e:
             error_msg = f"Unexpected error calling tool {actual_tool_name} on {server_name}: {str(e)}"
-            if server_name in self.server_status:
-                self.server_status[server_name]["status"] = "error"
-                self.server_status[server_name]["error"] = error_msg
+            if server_name in self._servers:
+                self._servers[server_name]["status"] = "error"
+                self._servers[server_name]["error"] = error_msg
             self._update_tui_error(error_msg)
             raise MCPClientError(error_msg)
     
@@ -385,7 +553,16 @@ class MCPServerManager:
         """Update TUI with MCP server status."""
         if self.topology_viz:
             try:
-                self.topology_viz.update_mcp_status(self.server_status)
+                # Extract status dict for TUI (only status, error, tools_count)
+                status_dict = {
+                    name: {
+                        "status": info["status"],
+                        "error": info.get("error"),
+                        "tools_count": info.get("tools_count", 0)
+                    }
+                    for name, info in self._servers.items()
+                }
+                self.topology_viz.update_mcp_status(status_dict)
             except Exception as e:
                 if DEBUG >= 2:
                     print(f"[MCP] Error updating TUI: {e}")
@@ -400,9 +577,11 @@ class MCPServerManager:
                     print(f"[MCP] Error updating TUI with error: {e}")
     
     def _load_server_config(self, name: str) -> Optional[Dict[str, Any]]:
-        """Load server config from failed_configs or config file."""
-        if name in self._failed_configs:
-            return self._failed_configs[name]
+        """Load server config from _servers or config file."""
+        # First check if we have it in _servers
+        if name in self._servers and self._servers[name].get("config"):
+            return self._servers[name]["config"]
+        # Fallback to config file
         if not self.config_path.exists():
             return None
         try:
@@ -434,8 +613,8 @@ class MCPServerManager:
         else:
             # Retry all failed servers
             failed_names = [
-                name for name, status in self.server_status.items()
-                if status.get("status") == "error" and name not in self.clients
+                name for name, info in self._servers.items()
+                if info.get("status") == "error" and name not in self.clients
             ]
             
             if not failed_names:
@@ -467,9 +646,23 @@ class MCPServerManager:
                 if not self._retry_task or self._retry_task.done():
                     break
                 
+                # Check for disconnected clients (process exited but client still exists)
+                for name, client in list(self.clients.items()):
+                    if hasattr(client, 'transport') and hasattr(client.transport, '_running'):
+                        if not client.transport._running:
+                            # Process exited, mark as failed and clean up
+                            if DEBUG >= 1:
+                                print(f"[MCP] Detected disconnected client for {name}, marking as failed")
+                            # Clean up the client
+                            self.clients.pop(name)
+                            asyncio.create_task(client.disconnect())
+                            # Mark as failed if we have config
+                            if name in self._servers and self._servers[name].get("config"):
+                                self._set_error_status(name, "Process exited unexpectedly", self._servers[name]["config"])
+                
                 failed_names = [
-                    name for name, status in self.server_status.items()
-                    if status.get("status") == "error" and name not in self.clients
+                    name for name, info in self._servers.items()
+                    if info.get("status") == "error" and name not in self.clients
                     and (name not in self._connection_tasks or self._connection_tasks[name].done())
                 ]
                 

@@ -1018,11 +1018,11 @@ class ChatGPTAPI:
       
       servers_data = {}
       # Get status for all servers (including failed ones)
-      for server_name, status in self.mcp_manager.server_status.items():
+      for server_name, info in self.mcp_manager._servers.items():
         server_info = {
-          "status": status.get("status", "unknown"),
-          "error": status.get("error"),
-          "tools_count": status.get("tools_count", 0)
+          "status": info.get("status", "unknown"),
+          "error": info.get("error"),
+          "tools_count": info.get("tools_count", 0)
         }
         
         # Get tools if server is connected

@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Dict, Optional, Any, AsyncIterator, Callable
+from typing import Dict, Optional, Any, AsyncIterator
 from pathlib import Path
 import aiohttp
 from exo import DEBUG
@@ -70,6 +70,8 @@ class StdioTransport:
                 env=full_env
             )
             
+            # MCP server processes should be long-running. If they exit, we'll detect
+            # it in the process monitor and trigger a retry.
             self._running = True
             self._read_task = asyncio.create_task(self._read_loop())
             
@@ -79,9 +81,12 @@ class StdioTransport:
             # Start stderr monitoring
             asyncio.create_task(self._monitor_stderr())
             
+            # Start process exit monitoring
+            asyncio.create_task(self._monitor_process())
+            
         except Exception as e:
             self._running = False
-            raise TransportError(f"Failed to start stdio process: {e}")
+            raise TransportError(f"{e}")
     
     async def _read_loop(self) -> None:
         """Read messages from stdout."""
@@ -93,6 +98,7 @@ class StdioTransport:
             while self._running and self.process:
                 chunk = await self.process.stdout.read(4096)
                 if not chunk:
+                    # EOF - process exited
                     break
                     
                 buffer += chunk.decode('utf-8', errors='replace')
@@ -110,11 +116,28 @@ class StdioTransport:
                     except json.JSONDecodeError:
                         if DEBUG >= 2:
                             print(f"[MCP] Failed to parse JSON: {line}")
+            
+            # Process exited (EOF detected), fail pending requests
+            if self._running and self.process:
+                self._running = False
+                returncode = self.process.returncode if self.process.returncode is not None else await self.process.wait()
+                error_msg = f"Process exited with code {returncode}"
+                for request_id, future in list(self._pending_requests.items()):
+                    if not future.done():
+                        future.set_exception(TransportError(error_msg))
+                        self._pending_requests.pop(request_id, None)
+                
                             
         except Exception as e:
             if DEBUG >= 1:
                 print(f"[MCP] Read loop error: {e}")
             self._running = False
+            # Fail pending requests on error
+            error_msg = f"Read loop error: {str(e)}"
+            for request_id, future in list(self._pending_requests.items()):
+                if not future.done():
+                    future.set_exception(TransportError(error_msg))
+                    self._pending_requests.pop(request_id, None)
     
     async def _monitor_stderr(self) -> None:
         """Monitor stderr for important messages."""
@@ -133,6 +156,32 @@ class StdioTransport:
         except Exception as e:
             if DEBUG >= 2:
                 print(f"[MCP] Stderr monitor error: {e}")
+    
+    async def _monitor_process(self) -> None:
+        """Monitor process exit and fail pending requests."""
+        if not self.process:
+            return
+            
+        try:
+            # Wait for process to exit
+            returncode = await self.process.wait()
+            
+            # Process exited, mark as not running
+            self._running = False
+            
+            # Fail all pending requests
+            error_msg = f"Process exited with code {returncode}"
+            for request_id, future in list(self._pending_requests.items()):
+                if not future.done():
+                    future.set_exception(TransportError(error_msg))
+                    self._pending_requests.pop(request_id, None)
+            
+            if DEBUG >= 1:
+                print(f"[MCP] Process exited with code {returncode}")
+                
+        except Exception as e:
+            if DEBUG >= 2:
+                print(f"[MCP] Process monitor error: {e}")
     
     async def send_notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
         """Send a JSON-RPC notification (no response expected)."""
