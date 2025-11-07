@@ -904,44 +904,65 @@ main {
   font-size: 0.85em;
 }
 
-.mcp-tools-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
 
-.mcp-tools-header {
-  font-weight: bold;
-  font-size: 0.9em;
-  color: var(--foreground-color);
-  margin-bottom: 4px;
-}
-
-.mcp-tool-item {
-  padding: 8px;
-  background-color: rgba(255, 255, 255, 0.05);
-  border-radius: 4px;
-  border-left: 2px solid var(--primary-color);
-}
-
-.mcp-tool-name {
-  font-weight: bold;
-  font-size: 0.9em;
-  color: var(--foreground-color);
-  margin-bottom: 4px;
-}
-
-.mcp-tool-description {
-  font-size: 0.85em;
-  color: var(--secondary-color-transparent);
-  line-height: 1.4;
-}
-
-.mcp-no-tools,
-.mcp-no-servers {
+.mcp-remarks {
   padding: 12px;
   text-align: center;
   color: var(--secondary-color-transparent);
   font-size: 0.9em;
   font-style: italic;
+}
+
+/* Tool call collapsible styles */
+details {
+  border: 1px solid rgba(var(--blue-color), 0.3);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 16px 0;
+  background: rgba(var(--blue-color), 0.05);
+}
+
+details[open] {
+  background: rgba(var(--blue-color), 0.08);
+}
+
+details summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 4px;
+  margin: -8px -8px 8px -8px;
+  border-radius: 4px;
+  transition: background-color 0.2s;
+  list-style: none;
+  display: flex;
+  align-items: center;
+}
+
+details summary::-webkit-details-marker {
+  display: none;
+}
+
+details summary::before {
+  content: '▶';
+  display: inline-block;
+  margin-right: 8px;
+  transition: transform 0.2s;
+  font-size: 0.8em;
+}
+
+details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+details summary:hover {
+  background: rgba(var(--blue-color), 0.15);
+}
+
+details summary strong {
+  color: rgba(var(--blue-color), 1);
+}
+
+/* Style tool call content inside details */
+details pre {
+  margin-top: 12px;
 }

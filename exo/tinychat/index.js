@@ -432,6 +432,9 @@ document.addEventListener("alpine:init", () => {
       const reader = response.body.pipeThrough(new TextDecoderStream())
         .pipeThrough(new EventSourceParserStream()).getReader();
       
+      let toolCallsBuffer = [];
+      let inToolCallSection = false;
+      
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -441,7 +444,54 @@ document.addEventListener("alpine:init", () => {
           if (json.choices) {
             const choice = json.choices[0];
             if (choice.finish_reason === "stop") break;
-            if (choice.delta.content) yield choice.delta.content;
+            
+            // Handle tool calls - buffer them
+            if (choice.delta.tool_calls) {
+              inToolCallSection = true;
+              for (const toolCall of choice.delta.tool_calls) {
+                if (toolCall.function) {
+                  const toolName = toolCall.function.name;
+                  const toolArgs = toolCall.function.arguments;
+                  
+                  // Format tool call nicely
+                  let formattedArgs = toolArgs;
+                  try {
+                    const argsObj = JSON.parse(toolArgs);
+                    formattedArgs = JSON.stringify(argsObj, null, 2);
+                  } catch (e) {
+                    // If parsing fails, use as is
+                  }
+                  
+                  toolCallsBuffer.push({
+                    name: toolName,
+                    args: formattedArgs
+                  });
+                }
+              }
+            }
+            
+            // Handle content
+            if (choice.delta.content) {
+              const content = choice.delta.content;
+              
+              // Check if this is the "Executing" message - if so, output buffered tool calls with collapsible
+              if (content.includes('Executing') && content.includes('tool') && toolCallsBuffer.length > 0) {
+                // Create collapsible section
+                let toolCallsHtml = '\n\n<details open>\n<summary><strong>' + content.trim() + '</strong></summary>\n\n';
+                
+                for (const tool of toolCallsBuffer) {
+                  toolCallsHtml += `**Tool:** \`${tool.name}\`\n\`\`\`json\n${tool.args}\n\`\`\`\n\n`;
+                }
+                
+                toolCallsHtml += '</details>\n\n';
+                
+                yield toolCallsHtml;
+                toolCallsBuffer = [];
+                inToolCallSection = false;
+              } else {
+                yield content;
+              }
+            }
           }
         }
       }

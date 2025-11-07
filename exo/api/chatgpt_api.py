@@ -725,11 +725,81 @@ class ChatGPTAPI:
             if DEBUG >= 1:
               print(f"[ChatGPTAPI] Executing {len(mcp_tool_calls)} MCP tool call(s) server-side (streaming)")
             
+            # Stream tool calls to client first (OpenAI compatible)
+            assistant_msg_content = decoded_content.split("<tool_call>")[0].strip() if "<tool_call>" in decoded_content else ""
+            
+            # Always send role first (required by streaming protocol)
+            role_chunk = {
+              "id": f"chatcmpl-{request_id}",
+              "object": "chat.completion.chunk",
+              "created": int(time.time()),
+              "model": chat_request.model,
+              "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": None
+              }]
+            }
+            await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+            
+            # Send content before tool calls (if any)
+            if assistant_msg_content:
+              content_chunk = {
+                "id": f"chatcmpl-{request_id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": chat_request.model,
+                "choices": [{
+                  "index": 0,
+                  "delta": {"content": assistant_msg_content},
+                  "finish_reason": None
+                }]
+              }
+              await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+            
+            # Stream tool calls (OpenAI compatible format)
+            for i, tool_call in enumerate(mcp_tool_calls):
+              tool_chunk = {
+                "id": f"chatcmpl-{request_id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": chat_request.model,
+                "choices": [{
+                  "index": 0,
+                  "delta": {
+                    "tool_calls": [{
+                      "index": i,
+                      "id": tool_call["id"],
+                      "type": "function",
+                      "function": {
+                        "name": tool_call["function"]["name"],
+                        "arguments": tool_call["function"]["arguments"]
+                      }
+                    }]
+                  },
+                  "finish_reason": None
+                }]
+              }
+              await response.write(f"data: {json.dumps(tool_chunk)}\n\n".encode())
+            
+            # Send execution status indicator (custom but informative)
+            execution_status = {
+              "id": f"chatcmpl-{request_id}",
+              "object": "chat.completion.chunk",
+              "created": int(time.time()),
+              "model": chat_request.model,
+              "choices": [{
+                "index": 0,
+                "delta": {"content": f"\n\n_Executing {len(mcp_tool_calls)} tool(s)..._\n\n"},
+                "finish_reason": None
+              }]
+            }
+            await response.write(f"data: {json.dumps(execution_status)}\n\n".encode())
+            
             # Execute tool calls
             tool_results = await execute_tool_calls(mcp_tool_calls, self.mcp_manager, self.node)
             
             # Add messages for continuation
-            assistant_msg_content = decoded_content.split("<tool_call>")[0].strip() if "<tool_call>" in decoded_content else decoded_content
             chat_request.messages.append(Message("assistant", assistant_msg_content, mcp_tool_calls))
             for tool_result in tool_results:
               chat_request.messages.append(Message("tool", tool_result["content"], tool_call_id=tool_result.get("tool_call_id"), name=tool_result.get("name")))
@@ -764,6 +834,8 @@ class ChatGPTAPI:
             if new_request_id in self.token_queues:
               del self.token_queues[new_request_id]
             
+            # Send final [DONE] marker
+            await response.write(b"data: [DONE]\n\n")
             await response.write_eof()
             return response
           
@@ -778,6 +850,8 @@ class ChatGPTAPI:
             )
             await response.write(f"data: {json.dumps(completion)}\n\n".encode())
 
+          # Send final [DONE] marker
+          await response.write(b"data: [DONE]\n\n")
           await response.write_eof()
           return response
 

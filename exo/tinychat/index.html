@@ -196,14 +196,14 @@
               </template>
               
               <template x-if="!subGroup.error && (!subGroup.tools || subGroup.tools.length === 0)">
-                <div class="mcp-no-tools">No tools available</div>
+                <div class="mcp-remarks">No tools available</div>
               </template>
             </div>
           </div>
         </template>
 
         <template x-if="Object.keys(mcpServers).length === 0 && !mcpLoading">
-          <div class="mcp-no-servers">No MCP servers configured</div>
+          <div class="mcp-remarks">No MCP servers configured</div>
         </template>
       </div>
     </div>
