@@ -225,7 +225,9 @@ async def download_shard(shard: Shard, inference_engine_classname: str, on_progr
     if DEBUG >= 6: print(f"Downloading {file['path']} {curr_bytes}/{total_bytes} {speed} {eta}")
   for file in filtered_file_list:
     downloaded_bytes = await get_downloaded_size(target_dir/file["path"])
-    file_progress[file["path"]] = RepoFileProgressEvent(repo_id, revision, file["path"], downloaded_bytes, 0, file["size"], 0, timedelta(0), "complete" if downloaded_bytes == file["size"] else "not_started", time.time())
+    total_bytes = max(file["size"], downloaded_bytes)
+    status = "complete" if downloaded_bytes >= total_bytes else "in_progress" if downloaded_bytes > 0 else "not_started"
+    file_progress[file["path"]] = RepoFileProgressEvent(repo_id, revision, file["path"], downloaded_bytes, 0, total_bytes, 0, timedelta(0), status, time.time())
 
   semaphore = asyncio.Semaphore(max_parallel_downloads)
   async def download_with_semaphore(file):

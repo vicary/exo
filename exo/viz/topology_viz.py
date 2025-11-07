@@ -376,10 +376,10 @@ class TopologyViz:
 
       for file_path, file_progress in download_progress.file_progress.items():
         if file_progress.status != "complete":
-          progress = int(file_progress.downloaded/file_progress.total*30)
+          percentage = (file_progress.downloaded / file_progress.total * 100) if file_progress.total > 0 else 0.0
+          progress = min(30, int(percentage / 100 * 30))
           bar = f"[{'=' * progress}{' ' * (30 - progress)}]"
-          percentage = f"{file_progress.downloaded / file_progress.total * 100:.0f}%"
-          summary.add_row(Text(file_path[:30], style="cyan"), bar, percentage)
+          summary.add_row(Text(file_path[:30], style="cyan"), bar, f"{percentage:.0f}%")
 
     summary.add_row("")  # Empty row for spacing
 
@@ -390,7 +390,7 @@ class TopologyViz:
         device = self.topology.nodes.get(node_id)
         partition = next((p for p in self.partitions if p.node_id == node_id), None)
         partition_info = f"[{partition.start:.2f}-{partition.end:.2f}]" if partition else ""
-        percentage = progress.downloaded_bytes/progress.total_bytes*100 if progress.total_bytes > 0 else 0
+        percentage = (progress.downloaded_bytes/progress.total_bytes*100) if progress.total_bytes > 0 else 0.0
         speed = pretty_print_bytes_per_second(progress.overall_speed)
         device_info = f"{device.model if device else 'Unknown Device'} {device.memory // 1024 if device else '?'}GB {partition_info}"
         progress_info = f"{progress.repo_id}@{progress.repo_revision} ({speed})"

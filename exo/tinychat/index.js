@@ -476,7 +476,7 @@ document.addEventListener("alpine:init", () => {
                   total_bytes_display: this.formatBytes(progress.total_bytes),
                   overall_speed_display: progress.overall_speed ? this.formatBytes(progress.overall_speed) + '/s' : '',
                   overall_eta_display: progress.overall_eta ? this.formatDuration(progress.overall_eta) : '',
-                  percentage: ((progress.downloaded_bytes / progress.total_bytes) * 100).toFixed(2)
+                  percentage: (Math.max(0, Math.min(1, progress.downloaded_bytes / progress.total_bytes)) * 100).toFixed(2)
                 };
               }
             });
