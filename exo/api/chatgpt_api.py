@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 from transformers import AutoTokenizer
-from typing import List, Literal, Union, Dict, Optional
+from typing import List, Literal, Union, Dict, Optional, Any
 from aiohttp import web
 import aiohttp_cors
 import traceback
@@ -36,7 +36,10 @@ else:
 
 def parse_tool_calls(content: str) -> tuple[Optional[str], Optional[List[Dict]], Optional[str]]:
   """
-  Parse tool calls from model output in XML format.
+  Parse tool calls from model output in various formats:
+  - XML format: <tool_call>...</tool_call>
+  - JSON in code blocks: ```json {...} ```
+  - Plain JSON objects with "name" and "arguments" fields
 
   Returns:
     tuple of (content_before_tools, tool_calls_list, finish_reason)
@@ -45,60 +48,118 @@ def parse_tool_calls(content: str) -> tuple[Optional[str], Optional[List[Dict]],
     - finish_reason: "tool_calls" if tools found, None otherwise
   """
   tool_calls = []
+  first_match_start = None
 
-  # Find all tool call matches
-  matches = list(re.finditer(r"<tool_call>\n(.+?)\n</tool_call>", content, re.DOTALL))
+  # Try XML format first: <tool_call>...</tool_call>
+  is_tool_call = list(re.finditer(r"<tool_call>\s*(.+?)\s*</tool_call>", content, re.DOTALL))
+  if is_tool_call:
+    first_match_start = is_tool_call[0].start()
+    for match in is_tool_call:
+      try:
+        tool_call_json = json.loads(match.group(1))
+        if "name" in tool_call_json:
+          # Ensure arguments is a JSON string (not an object)
+          if "arguments" in tool_call_json and isinstance(tool_call_json["arguments"], dict):
+            tool_call_json["arguments"] = json.dumps(tool_call_json["arguments"])
+          
+          call_id = f"call_{uuid.uuid4().hex[:24]}"
+          tool_calls.append({
+            "id": call_id,
+            "type": "function",
+            "function": {
+              "name": tool_call_json.get("name", ""),
+              "arguments": tool_call_json.get("arguments", "{}")
+            }
+          })
+      except (json.JSONDecodeError, KeyError) as e:
+        if DEBUG >= 2:
+          print(f"Failed to parse XML tool call: {match.group(1)}, Error: {e}")
+        continue
 
-  if not matches:
+  # If no XML matches, try JSON in code blocks: ```json {...} ```
+  if not tool_calls:
+    json_block_pattern = r"```(?:json)?\s*(\{.*?\"name\".*?\"arguments\".*?\})\s*```"
+    is_json_rpc = list(re.finditer(json_block_pattern, content, re.DOTALL))
+    if is_json_rpc:
+      first_match_start = is_json_rpc[0].start()
+      for match in is_json_rpc:
+        try:
+          tool_call_json = json.loads(match.group(1))
+          if "name" in tool_call_json:
+            # Ensure arguments is a JSON string (not an object)
+            if "arguments" in tool_call_json and isinstance(tool_call_json["arguments"], dict):
+              tool_call_json["arguments"] = json.dumps(tool_call_json["arguments"])
+            
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            tool_calls.append({
+              "id": call_id,
+              "type": "function",
+              "function": {
+                "name": tool_call_json.get("name", ""),
+                "arguments": tool_call_json.get("arguments", "{}")
+              }
+            })
+        except (json.JSONDecodeError, KeyError) as e:
+          if DEBUG >= 2:
+            print(f"Failed to parse JSON block tool call: {match.group(1)}, Error: {e}")
+          continue
+
+  # If still no matches, try finding standalone JSON objects with "name" and "arguments"
+  if not tool_calls:
+    # Look for JSON objects that look like tool calls: {"name": "...", "arguments": {...}}
+    json_obj_pattern = r'\{[^{}]*"name"\s*:\s*"[^"]+"[^{}]*"arguments"\s*:\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*\}'
+    json_obj_matches = list(re.finditer(json_obj_pattern, content, re.DOTALL))
+    if json_obj_matches:
+      first_match_start = json_obj_matches[0].start()
+      for match in json_obj_matches:
+        try:
+          tool_call_json = json.loads(match.group(0))
+          if "name" in tool_call_json and "arguments" in tool_call_json:
+            # Ensure arguments is a JSON string (not an object)
+            if isinstance(tool_call_json["arguments"], dict):
+              tool_call_json["arguments"] = json.dumps(tool_call_json["arguments"])
+            
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            tool_calls.append({
+              "id": call_id,
+              "type": "function",
+              "function": {
+                "name": tool_call_json.get("name", ""),
+                "arguments": tool_call_json.get("arguments", "{}")
+              }
+            })
+        except (json.JSONDecodeError, KeyError) as e:
+          if DEBUG >= 2:
+            print(f"Failed to parse standalone JSON tool call: {match.group(0)}, Error: {e}")
+          continue
+
+  if not tool_calls:
     return None, None, None
 
   # Get content before first tool call
-  first_match_start = matches[0].start()
-  content_before = content[:first_match_start].strip() if first_match_start > 0 else None
+  content_before = content[:first_match_start].strip() if first_match_start and first_match_start > 0 else None
 
-  # Parse each tool call
-  for match in matches:
-    try:
-      tool_call_json = json.loads(match.group(1))
-
-      # Ensure arguments is a JSON string (not an object)
-      if "arguments" in tool_call_json and isinstance(tool_call_json["arguments"], dict):
-        tool_call_json["arguments"] = json.dumps(tool_call_json["arguments"])
-
-      # Generate unique call ID
-      call_id = f"call_{uuid.uuid4().hex[:24]}"
-
-      # Format according to OpenAI spec
-      tool_calls.append({
-        "id": call_id,
-        "type": "function",
-        "function": {
-          "name": tool_call_json.get("name", ""),
-          "arguments": tool_call_json.get("arguments", "{}")
-        }
-      })
-    except json.JSONDecodeError as e:
-      if DEBUG >= 2:
-        print(f"Failed to parse tool call JSON: {match.group(1)}")
-        print(f"Error: {e}")
-      continue
-
-  if tool_calls:
-    return content_before, tool_calls, "tool_calls"
-
-  return None, None, None
+  return content_before, tool_calls, "tool_calls"
 
 
 class Message:
-  def __init__(self, role: str, content: Union[str, List[Dict[str, Union[str, Dict[str, str]]]]], tools: Optional[List[Dict]] = None):
+  def __init__(self, role: str, content: Union[str, List[Dict[str, Union[str, Dict[str, str]]]]], tools: Optional[List[Dict]] = None, tool_call_id: Optional[str] = None, name: Optional[str] = None):
     self.role = role
     self.content = content
     self.tools = tools
+    self.tool_call_id = tool_call_id
+    self.name = name
 
   def to_dict(self):
     data = {"role": self.role, "content": self.content}
-    if self.tools:
-      data["tools"] = self.tools
+    # For assistant messages, tools should be tool_calls, not tool definitions
+    if self.tools and self.role == "assistant":
+      data["tool_calls"] = self.tools
+    # Don't include tools field for other roles - tool definitions go in chat template, not messages
+    if self.tool_call_id:
+      data["tool_call_id"] = self.tool_call_id
+    if self.name:
+      data["name"] = self.name
     return data
 
 
@@ -110,7 +171,94 @@ class ChatCompletionRequest:
     self.tools = tools
 
   def to_dict(self):
-    return {"model": self.model, "messages": [message.to_dict() for message in self.messages], "temperature": self.temperature, "tools": self.tools}
+    # Don't include tools in response - they're only for model context
+    return {"model": self.model, "messages": [message.to_dict() for message in self.messages], "temperature": self.temperature}
+
+
+def get_tool_handling_strategy(tool_calls: List[Dict], client_tools: Optional[List[Dict]], mcp_manager: Optional[Any]) -> tuple[str, List[Dict]]:
+  """
+  Determine how to handle tool calls.
+  
+  Returns:
+    tuple of (strategy, mcp_tool_calls)
+    - strategy: "server_side" (execute MCP tools), "client_side" (send to client), or "error" (no match)
+    - mcp_tool_calls: List of MCP tool calls to execute server-side
+  """
+  if not tool_calls:
+    return "none", []
+  
+  # Get available tool names
+  client_tool_names = set()
+  if client_tools:
+    for tool in client_tools:
+      if isinstance(tool, dict) and "function" in tool:
+        client_tool_names.add(tool["function"].get("name", ""))
+  
+  mcp_tool_names = set()
+  if mcp_manager:
+    mcp_tools = mcp_manager.get_all_tools()
+    mcp_tool_names = {tool["name"] for tool in mcp_tools}
+  
+  # Categorize tool calls
+  mcp_tool_calls = []
+  client_tool_calls = []
+  unknown_tool_calls = []
+  
+  for tool_call in tool_calls:
+    tool_name = tool_call["function"]["name"]
+    if tool_name.startswith("mcp_") and tool_name in mcp_tool_names:
+      mcp_tool_calls.append(tool_call)
+    elif tool_name in client_tool_names:
+      client_tool_calls.append(tool_call)
+    else:
+      unknown_tool_calls.append(tool_call)
+  
+  # Determine strategy
+  if unknown_tool_calls:
+    # Some tools don't match anything - return error
+    return "error", []
+  elif client_tools:
+    # Client provided tools exist - use legacy behavior (send to client)
+    # Even if MCP tools are called, prioritize client-side handling
+    return "client_side", []
+  elif mcp_tool_calls:
+    # No client tools, but MCP tools are called - execute server-side
+    return "server_side", mcp_tool_calls
+  else:
+    return "none", []
+
+
+async def execute_tool_calls(tool_calls: List[Dict], mcp_manager: Optional[Any]) -> List[Dict]:
+  """Execute MCP tool calls server-side and return tool results."""
+  tool_results = []
+  for tool_call in tool_calls:
+    tool_name = tool_call["function"]["name"]
+    try:
+      arguments = json.loads(tool_call["function"]["arguments"])
+    except (json.JSONDecodeError, TypeError):
+      arguments = tool_call["function"]["arguments"] if isinstance(tool_call["function"]["arguments"], dict) else {}
+    
+    try:
+      result = await mcp_manager.call_tool(tool_name, arguments)
+      tool_results.append({
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "name": tool_name,
+        "content": json.dumps(result) if not isinstance(result, str) else result
+      })
+      if DEBUG >= 1:
+        print(f"[ChatGPTAPI] Executed MCP tool {tool_name}: {result}")
+    except Exception as e:
+      if DEBUG >= 1:
+        print(f"[ChatGPTAPI] Error executing MCP tool {tool_name}: {e}")
+      tool_results.append({
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "name": tool_name,
+        "content": json.dumps({"error": str(e)})
+      })
+  
+  return tool_results
 
 
 def generate_completion(
@@ -122,6 +270,7 @@ def generate_completion(
   stream: bool,
   finish_reason: Union[Literal["length", "stop", "tool_calls"], None],
   object_type: Literal["chat.completion", "text_completion"],
+  include_tool_calls: bool = True,
 ) -> dict:
   decoded_content = tokenizer.decode(tokens)
 
@@ -130,7 +279,7 @@ def generate_completion(
   tool_calls = None
   tool_finish_reason = None
 
-  if chat_request.tools:
+  if chat_request.tools or (hasattr(chat_request, 'mcp_manager') and chat_request.mcp_manager):
     content_before_tools, tool_calls, tool_finish_reason = parse_tool_calls(decoded_content)
 
   # Override finish_reason if tool calls were detected
@@ -168,8 +317,8 @@ def generate_completion(
       "content": content_before_tools if tool_calls else decoded_content
     }
 
-    # Add tool_calls array if tools were called
-    if tool_calls:
+    # Add tool_calls array only if we're not executing server-side
+    if tool_calls and include_tool_calls:
       message_content["tool_calls"] = tool_calls
 
     choice[key_name] = message_content
@@ -216,11 +365,33 @@ def remap_messages(messages: List[Message]) -> List[Message]:
   return remapped_messages
 
 
-def build_prompt(tokenizer, _messages: List[Message], tools: Optional[List[Dict]] = None):
+def build_prompt(tokenizer, _messages: List[Message], tools: Optional[List[Dict]] = None, mcp_manager: Optional[Any] = None):
   messages = remap_messages(_messages)
   chat_template_args = {"conversation": [m.to_dict() for m in messages], "tokenize": False, "add_generation_prompt": True}
-  if tools: 
-    chat_template_args["tools"] = tools
+  
+  # Merge MCP tools with provided tools
+  all_tools = list(tools) if tools else []
+  if mcp_manager:
+    mcp_tools = mcp_manager.get_all_tools()
+    # Convert MCP tools to OpenAI format
+    for mcp_tool in mcp_tools:
+      input_schema = mcp_tool.get("inputSchema", {})
+      # Handle nested inputSchema (some MCP servers wrap it in "params")
+      if isinstance(input_schema, dict) and "params" in input_schema and len(input_schema) == 1:
+        input_schema = input_schema["params"]
+      
+      openai_tool = {
+        "type": "function",
+        "function": {
+          "name": mcp_tool["name"],
+          "description": mcp_tool.get("description", ""),
+          "parameters": input_schema
+        }
+      }
+      all_tools.append(openai_tool)
+  
+  if all_tools: 
+    chat_template_args["tools"] = all_tools
 
   try:
     prompt = tokenizer.apply_chat_template(**chat_template_args)
@@ -268,7 +439,8 @@ class ChatGPTAPI:
     response_timeout: int = 90,
     on_chat_completion_request: Callable[[str, ChatCompletionRequest, str], None] = None,
     default_model: Optional[str] = None,
-    system_prompt: Optional[str] = None
+    system_prompt: Optional[str] = None,
+    mcp_manager: Optional[Any] = None
   ):
     self.node = node
     self.inference_engine_classname = inference_engine_classname
@@ -280,6 +452,7 @@ class ChatGPTAPI:
     self.stream_tasks: Dict[str, asyncio.Task] = {}
     self.default_model = default_model or "llama-3.2-1b"
     self.token_queues = defaultdict(asyncio.Queue)
+    self.mcp_manager = mcp_manager
 
     # Get the callback system and register our handler
     self.token_callback = node.on_token.register("chatgpt-api-token-handler")
@@ -310,6 +483,10 @@ class ChatGPTAPI:
     cors.add(self.app.router.add_post("/download", self.handle_post_download), {"*": cors_options})
     cors.add(self.app.router.add_get("/v1/topology", self.handle_get_topology), {"*": cors_options})
     cors.add(self.app.router.add_get("/topology", self.handle_get_topology), {"*": cors_options})
+    cors.add(self.app.router.add_post("/mcp/retry", self.handle_mcp_retry), {"*": cors_options})
+    cors.add(self.app.router.add_post("/v1/mcp/retry", self.handle_mcp_retry), {"*": cors_options})
+    cors.add(self.app.router.add_get("/mcp/status", self.handle_get_mcp_status), {"*": cors_options})
+    cors.add(self.app.router.add_get("/v1/mcp/status", self.handle_get_mcp_status), {"*": cors_options})
 
     # Add static routes
     if "__compiled__" not in globals():
@@ -384,7 +561,7 @@ class ChatGPTAPI:
     shard = build_base_shard(model, self.inference_engine_classname)
     messages = [parse_message(msg) for msg in data.get("messages", [])]
     tokenizer = await resolve_tokenizer(get_repo(shard.model_id, self.inference_engine_classname))
-    prompt = build_prompt(tokenizer, messages, data.get("tools", None))
+    prompt = build_prompt(tokenizer, messages, data.get("tools", None), self.mcp_manager)
     tokens = tokenizer.encode(prompt)
     return web.json_response({
       "length": len(prompt),
@@ -428,7 +605,7 @@ class ChatGPTAPI:
     if self.system_prompt and not any(msg.role == "system" for msg in chat_request.messages):
       chat_request.messages.insert(0, Message("system", self.system_prompt))
 
-    prompt = build_prompt(tokenizer, chat_request.messages, chat_request.tools)
+    prompt = build_prompt(tokenizer, chat_request.messages, chat_request.tools, self.mcp_manager)
     request_id = str(uuid.uuid4())
     if self.on_chat_completion_request:
       try:
@@ -455,7 +632,8 @@ class ChatGPTAPI:
         await response.prepare(request)
 
         try:
-          # Stream tokens while waiting for inference to complete
+          # Collect all tokens first to check for tool calls
+          all_tokens = []
           while True:
             if DEBUG >= 2: print(f"[ChatGPTAPI] Waiting for token from queue: {request_id=}")
             tokens, is_finished = await asyncio.wait_for(
@@ -463,30 +641,91 @@ class ChatGPTAPI:
               timeout=self.response_timeout
             )
             if DEBUG >= 2: print(f"[ChatGPTAPI] Got token from queue: {request_id=} {tokens=} {is_finished=}")
-
-            eos_token_id = None
-            if not eos_token_id and hasattr(tokenizer, "eos_token_id"): eos_token_id = tokenizer.eos_token_id
-            if not eos_token_id and hasattr(tokenizer, "_tokenizer"): eos_token_id = tokenizer.special_tokens_map.get("eos_token_id")
-
-            finish_reason = None
-            if is_finished: finish_reason = "stop" if tokens[-1] == eos_token_id else "length"
-            if DEBUG >= 2: print(f"{eos_token_id=} {tokens[-1]=} {finish_reason=}")
-
-            completion = generate_completion(
-              chat_request,
-              tokenizer,
-              prompt,
-              request_id,
-              tokens,
-              stream,
-              finish_reason,
-              "chat.completion",
-            )
-
-            await response.write(f"data: {json.dumps(completion)}\n\n".encode())
-
+            all_tokens.extend(tokens)
             if is_finished:
               break
+          
+          eos_token_id = None
+          if not eos_token_id and hasattr(tokenizer, "eos_token_id"): eos_token_id = tokenizer.eos_token_id
+          if not eos_token_id and hasattr(tokenizer, "_tokenizer"): eos_token_id = tokenizer.special_tokens_map.get("eos_token_id")
+          
+          finish_reason = "length"
+          if all_tokens and all_tokens[-1] == eos_token_id:
+            finish_reason = "stop"
+          
+          # Check for tool calls
+          decoded_content = tokenizer.decode(all_tokens)
+          _, tool_calls, _ = parse_tool_calls(decoded_content)
+          
+          # Determine tool handling strategy
+          strategy, mcp_tool_calls = get_tool_handling_strategy(tool_calls, chat_request.tools, self.mcp_manager)
+          
+          if strategy == "error":
+            # Unknown tools - return error
+            return web.json_response({
+              "error": {
+                "message": f"Tool calls reference unknown tools. Available: client tools={bool(chat_request.tools)}, MCP tools={bool(self.mcp_manager)}",
+                "type": "invalid_request_error"
+              }
+            }, status=400)
+          
+          elif strategy == "server_side" and mcp_tool_calls:
+            # Execute MCP tools server-side and continue
+            if DEBUG >= 1:
+              print(f"[ChatGPTAPI] Executing {len(mcp_tool_calls)} MCP tool call(s) server-side (streaming)")
+            
+            # Execute tool calls
+            tool_results = await execute_tool_calls(mcp_tool_calls, self.mcp_manager)
+            
+            # Add messages for continuation
+            assistant_msg_content = decoded_content.split("<tool_call>")[0].strip() if "<tool_call>" in decoded_content else decoded_content
+            chat_request.messages.append(Message("assistant", assistant_msg_content, mcp_tool_calls))
+            for tool_result in tool_results:
+              chat_request.messages.append(Message("tool", tool_result["content"], tool_call_id=tool_result.get("tool_call_id"), name=tool_result.get("name")))
+            
+            # Continue generation
+            new_prompt = build_prompt(tokenizer, chat_request.messages, chat_request.tools, self.mcp_manager)
+            new_request_id = str(uuid.uuid4())
+            
+            await asyncio.wait_for(
+              asyncio.shield(asyncio.create_task(self.node.process_prompt(shard, new_prompt, request_id=new_request_id))),
+              timeout=self.response_timeout
+            )
+            
+            # Stream continuation tokens
+            while True:
+              _tokens, is_finished = await asyncio.wait_for(self.token_queues[new_request_id].get(), timeout=self.response_timeout)
+              eos_token_id = None
+              if not eos_token_id and hasattr(tokenizer, "eos_token_id"): eos_token_id = tokenizer.eos_token_id
+              if not eos_token_id and hasattr(tokenizer, "_tokenizer"): eos_token_id = tokenizer.special_tokens_map.get("eos_token_id")
+
+              finish_reason = None
+              if is_finished: finish_reason = "stop" if _tokens and _tokens[-1] == eos_token_id else "length"
+
+              completion = generate_completion(
+                chat_request, tokenizer, new_prompt, new_request_id, _tokens, stream, finish_reason, "chat.completion", include_tool_calls=False
+              )
+              await response.write(f"data: {json.dumps(completion)}\n\n".encode())
+
+              if is_finished:
+                break
+            
+            if new_request_id in self.token_queues:
+              del self.token_queues[new_request_id]
+            
+            await response.write_eof()
+            return response
+          
+          # Client-side tools or no tools - stream response (include tool_calls for client-side)
+          include_tool_calls = (strategy == "client_side")
+          for i in range(0, len(all_tokens), 10):  # Stream in chunks
+            chunk_tokens = all_tokens[:i+10] if i+10 < len(all_tokens) else all_tokens
+            chunk_finish_reason = finish_reason if i+10 >= len(all_tokens) else None
+            
+            completion = generate_completion(
+              chat_request, tokenizer, prompt, request_id, chunk_tokens, stream, chunk_finish_reason, "chat.completion", include_tool_calls=include_tool_calls
+            )
+            await response.write(f"data: {json.dumps(completion)}\n\n".encode())
 
           await response.write_eof()
           return response
@@ -524,7 +763,76 @@ class ChatGPTAPI:
         if tokens[-1] == eos_token_id:
           finish_reason = "stop"
 
-        return web.json_response(generate_completion(chat_request, tokenizer, prompt, request_id, tokens, stream, finish_reason, "chat.completion"))
+        # Check for tool calls
+        decoded_content = tokenizer.decode(tokens)
+        _, tool_calls, _ = parse_tool_calls(decoded_content)
+        
+        # Determine tool handling strategy
+        strategy, mcp_tool_calls = get_tool_handling_strategy(tool_calls, chat_request.tools, self.mcp_manager)
+        
+        if strategy == "error":
+          # Unknown tools - return error
+          return web.json_response({
+            "error": {
+              "message": f"Tool calls reference unknown tools. Available: client tools={bool(chat_request.tools)}, MCP tools={bool(self.mcp_manager)}",
+              "type": "invalid_request_error"
+            }
+          }, status=400)
+        
+        elif strategy == "server_side" and mcp_tool_calls:
+          # Execute MCP tools server-side and continue
+          if DEBUG >= 1:
+            print(f"[ChatGPTAPI] Executing {len(mcp_tool_calls)} MCP tool call(s) server-side")
+          
+          # Execute tool calls
+          tool_results = await execute_tool_calls(mcp_tool_calls, self.mcp_manager)
+          
+          # Add assistant message with tool calls and tool results to conversation
+          assistant_msg_content = decoded_content.split("<tool_call>")[0].strip() if "<tool_call>" in decoded_content else decoded_content
+          chat_request.messages.append(Message("assistant", assistant_msg_content, mcp_tool_calls))
+          for tool_result in tool_results:
+            chat_request.messages.append(Message("tool", tool_result["content"], tool_call_id=tool_result.get("tool_call_id"), name=tool_result.get("name")))
+          
+          # Continue generation with tool results
+          if DEBUG >= 1:
+            print(f"[ChatGPTAPI] Continuing generation with tool results")
+          
+          # Build new prompt with tool results
+          new_prompt = build_prompt(tokenizer, chat_request.messages, chat_request.tools, self.mcp_manager)
+          new_request_id = str(uuid.uuid4())
+          
+          # Process continuation
+          await asyncio.wait_for(
+            asyncio.shield(asyncio.create_task(self.node.process_prompt(shard, new_prompt, request_id=new_request_id))),
+            timeout=self.response_timeout
+          )
+          
+          # Get continuation tokens
+          continuation_tokens = []
+          while True:
+            _tokens, is_finished = await asyncio.wait_for(self.token_queues[new_request_id].get(), timeout=self.response_timeout)
+            continuation_tokens.extend(_tokens)
+            if is_finished:
+              break
+          
+          # Clean up continuation queue
+          if new_request_id in self.token_queues:
+            del self.token_queues[new_request_id]
+          
+          # Generate final completion with continuation
+          continuation_finish_reason = "length"
+          if continuation_tokens and continuation_tokens[-1] == eos_token_id:
+            continuation_finish_reason = "stop"
+          
+          final_completion = generate_completion(
+            chat_request, tokenizer, new_prompt, new_request_id, continuation_tokens, stream, continuation_finish_reason, "chat.completion", include_tool_calls=False
+          )
+          return web.json_response(final_completion)
+        
+        # Client-side tools or no tools - return response (include tool_calls for client-side)
+        include_tool_calls = (strategy == "client_side")
+        completion = generate_completion(chat_request, tokenizer, prompt, request_id, tokens, stream, finish_reason, "chat.completion", include_tool_calls=include_tool_calls)
+        return web.json_response(completion)
     except asyncio.TimeoutError:
       return web.json_response({"detail": "Response generation timed out"}, status=408)
     except Exception as e:
@@ -701,6 +1009,62 @@ class ChatGPTAPI:
     except Exception as e:
       if DEBUG >= 2: traceback.print_exc()
       return web.json_response({"detail": f"Error getting topology: {str(e)}"}, status=500)
+
+  async def handle_get_mcp_status(self, request):
+    """Get MCP server status and tools."""
+    try:
+      if not self.mcp_manager:
+        return web.json_response({"servers": {}}, status=200)
+      
+      servers_data = {}
+      # Get status for all servers (including failed ones)
+      for server_name, status in self.mcp_manager.server_status.items():
+        server_info = {
+          "status": status.get("status", "unknown"),
+          "error": status.get("error"),
+          "tools_count": status.get("tools_count", 0)
+        }
+        
+        # Get tools if server is connected
+        if server_name in self.mcp_manager.clients:
+          client = self.mcp_manager.clients[server_name]
+          tools = []
+          for tool in client.tools:
+            tools.append({
+              "name": tool.get("name", ""),
+              "description": tool.get("description", ""),
+              "inputSchema": tool.get("inputSchema", {})
+            })
+          server_info["tools"] = tools
+        else:
+          server_info["tools"] = []
+        
+        servers_data[server_name] = server_info
+      
+      return web.json_response({"servers": servers_data}, status=200)
+    except Exception as e:
+      if DEBUG >= 2: traceback.print_exc()
+      return web.json_response({"error": str(e)}, status=500)
+
+  async def handle_mcp_retry(self, request):
+    """Retry MCP server initialization for failed servers."""
+    try:
+      if not self.mcp_manager:
+        return web.json_response({"error": "MCP manager not available"}, status=503)
+      
+      server_name = None
+      if request.content_length and request.content_length > 0:
+        try:
+          data = await request.json()
+          server_name = data.get("server_name")  # Optional: if None, retries all failed servers
+        except Exception:
+          pass  # If JSON parsing fails, treat as empty request
+      
+      results = await self.mcp_manager.retry_server(server_name)
+      return web.json_response(results, status=200)
+    except Exception as e:
+      if DEBUG >= 2: traceback.print_exc()
+      return web.json_response({"error": str(e)}, status=500)
 
   async def handle_tokens(self, request_id: str, tokens: List[int], is_finished: bool):
     await self.token_queues[request_id].put((tokens, is_finished))

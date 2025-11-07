@@ -1,6 +1,6 @@
 import math
 from collections import OrderedDict
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 from exo.helpers import exo_text, pretty_print_bytes, pretty_print_bytes_per_second
 from exo.topology.topology import Topology
 from exo.topology.partitioning_strategy import Partition
@@ -26,19 +26,24 @@ class TopologyViz:
     self.node_id = None
     self.node_download_progress: Dict[str, RepoProgressEvent] = {}
     self.requests: OrderedDict[str, Tuple[str, str]] = {}
+    self.mcp_status: Dict[str, Dict[str, Any]] = {}
+    self.mcp_errors: List[str] = []
 
     self.console = Console()
     self.layout = Layout()
-    self.layout.split(Layout(name="main"), Layout(name="prompt_output", size=15), Layout(name="download", size=25))
+    self.layout.split(Layout(name="main"), Layout(name="prompt_output", size=15), Layout(name="download", size=25), Layout(name="mcp", size=10))
     self.main_panel = Panel(self._generate_main_layout(), title="Exo Cluster (0 nodes)", border_style="bright_yellow")
     self.prompt_output_panel = Panel("", title="Prompt and Output", border_style="green")
     self.download_panel = Panel("", title="Download Progress", border_style="cyan")
+    self.mcp_panel = Panel("", title="MCP Servers", border_style="magenta")
     self.layout["main"].update(self.main_panel)
     self.layout["prompt_output"].update(self.prompt_output_panel)
     self.layout["download"].update(self.download_panel)
+    self.layout["mcp"].update(self.mcp_panel)
 
-    # Initially hide the prompt_output panel
+    # Initially hide panels
     self.layout["prompt_output"].visible = False
+    self.layout["mcp"].visible = False
     self.live_panel = Live(self.layout, auto_refresh=False, console=self.console)
     self.live_panel.start()
 
@@ -79,7 +84,28 @@ class TopologyViz:
     else:
       self.layout["download"].visible = False
 
+    # Show MCP panel if there are MCP servers or errors
+    if self.mcp_status or self.mcp_errors:
+      self.mcp_panel.renderable = self._generate_mcp_layout()
+      self.layout["mcp"].update(self.mcp_panel)
+      self.layout["mcp"].visible = True
+    else:
+      self.layout["mcp"].visible = False
+
     self.live_panel.update(self.layout, refresh=True)
+  
+  def update_mcp_status(self, status: Dict[str, Dict[str, Any]]) -> None:
+    """Update MCP server status."""
+    self.mcp_status = status
+    self.refresh()
+  
+  def update_mcp_error(self, error_msg: str) -> None:
+    """Add an MCP error message."""
+    self.mcp_errors.append(error_msg)
+    # Keep only last 5 errors
+    if len(self.mcp_errors) > 5:
+      self.mcp_errors = self.mcp_errors[-5:]
+    self.refresh()
 
   def _generate_prompt_output_layout(self) -> Panel:
     content = []
@@ -374,4 +400,54 @@ class TopologyViz:
         summary.add_row(device_info, progress_info, percentage_str)
         summary.add_row("", progress_bar, eta_str)
 
+    return summary
+  
+  def _generate_mcp_layout(self) -> Table:
+    """Generate MCP server status layout."""
+    summary = Table(show_header=False, box=None, padding=(0, 1), expand=True)
+    summary.add_column("Server", style="magenta", no_wrap=True, ratio=30)
+    summary.add_column("Status", style="magenta", no_wrap=True, ratio=20)
+    summary.add_column("Info", style="magenta", no_wrap=True, ratio=50)
+    
+    # Display server statuses
+    for server_name, status_info in self.mcp_status.items():
+      status = status_info.get("status", "unknown")
+      error = status_info.get("error")
+      tools_count = status_info.get("tools_count", 0)
+      
+      # Status indicator
+      if status == "connected":
+        status_text = Text("✓ Connected", style="green")
+        info_text = f"{tools_count} tool{'s' if tools_count != 1 else ''}"
+      elif status == "connecting":
+        status_text = Text("⟳ Connecting", style="yellow")
+        info_text = "Initializing..."
+      elif status == "error":
+        status_text = Text("✗ Error", style="red")
+        # Format error message
+        if error:
+          info_text = str(error)
+          # Truncate only if very long, but allow more space
+          if len(info_text) > 80:
+            info_text = info_text[:77] + "..."
+        else:
+          info_text = "Unknown error"
+      else:
+        status_text = Text(f"? {status}", style="white")
+        info_text = ""
+      
+      summary.add_row(Text(server_name, style="bold"), status_text, Text(info_text, style="red" if status == "error" else "white"))
+    
+    # Display recent errors
+    if self.mcp_errors:
+      summary.add_row("")  # Empty row
+      summary.add_row(Text("Recent Errors:", style="bold red"))
+      for error in self.mcp_errors[-3:]:  # Show last 3 errors
+        # Format error message
+        error_display = str(error)
+        # Allow longer error messages (up to 100 chars)
+        if len(error_display) > 100:
+          error_display = error_display[:97] + "..."
+        summary.add_row("", Text("⚠", style="red"), Text(error_display, style="red"))
+    
     return summary

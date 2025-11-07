@@ -47,7 +47,15 @@ document.addEventListener("alpine:init", () => {
 
     // Add these new properties
     expandedGroups: {},
-
+    
+    // Models section collapse state
+    modelsExpanded: true,
+    
+    // MCP section state
+    mcpExpanded: true,
+    mcpServers: {},
+    mcpLoading: false,
+    
     init() {
       // Clean up any pending messages
       localStorage.removeItem("pendingMessage");
@@ -60,6 +68,9 @@ document.addEventListener("alpine:init", () => {
 
       // Start model polling with the new pattern
       this.startModelPolling();
+      
+      // Start MCP status polling
+      this.startMcpPolling();
     },
 
     async fetchInitialModels() {
@@ -78,13 +89,12 @@ document.addEventListener("alpine:init", () => {
       while (true) {
         try {
           await this.populateSelector();
-          // Wait 15 seconds before next poll
-          await new Promise(resolve => setTimeout(resolve, 15000));
         } catch (error) {
           console.error('Model polling error:', error);
-          // If there's an error, wait before retrying
-          await new Promise(resolve => setTimeout(resolve, 15000));
         }
+
+        // Wait 15 seconds before next poll
+        await new Promise(resolve => setTimeout(resolve, 15000));
       }
     },
 
@@ -725,6 +735,45 @@ document.addEventListener("alpine:init", () => {
     isGroupExpanded(prefix, subPrefix = null) {
       const key = subPrefix ? `${prefix}-${subPrefix}` : prefix;
       return this.expandedGroups[key] || false;
+    },
+    
+    // MCP server methods
+    async fetchMcpStatus() {
+      try {
+        this.mcpLoading = true;
+        const response = await fetch(`${window.location.origin}/mcp/status`);
+        if (response.ok) {
+          const data = await response.json();
+          this.mcpServers = data.servers || {};
+        }
+      } catch (error) {
+        console.error('Error fetching MCP status:', error);
+      } finally {
+        this.mcpLoading = false;
+      }
+    },
+
+    async startMcpPolling() {
+      while (true) {
+        try {
+          await this.fetchMcpStatus();
+        } catch (error) {
+          console.error('MCP polling error:', error);
+        }
+
+        // Wait 5 seconds before next poll
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    },
+    
+    getStatusText(status) {
+      const statusMap = {
+        'connected': 'Connected',
+        'connecting': 'Connecting...',
+        'error': 'Error',
+        'unknown': 'Unknown'
+      };
+      return statusMap[status] || status;
     },
   }));
 });

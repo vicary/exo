@@ -5,7 +5,10 @@
   --secondary-color-transparent: #ffffff66;
   --primary-bg-color: #1a1a1a;
   --foreground-color: #f0f0f0;
-  --red-color: #a52e4d;
+  --red-color: /* #a52e4d */ 165, 46, 77;
+  --yellow-color: /* #ff9800 */ 255, 152, 0;
+  --green-color: /* #4CAF50 */ 76, 175, 80;
+  --blue-color: /* #2196F3 */ 33, 150, 243;
 }
 
 main {
@@ -469,7 +472,7 @@ p {
 }
 
 .clear-history-button {
-  background-color: var(--red-color);
+  background-color: rgb(var(--red-color-rgb));
   color: white;
   padding: 10px 20px;
   border-radius: 5px;
@@ -597,7 +600,7 @@ main {
 .model-delete-button {
     background: none;
     border: none;
-    color: var(--red-color);
+    color: rgb(var(--red-color-rgb));
     padding: 4px 8px;
     cursor: pointer;
     transition: all 0.2s ease;
@@ -678,7 +681,6 @@ main {
 }
 
 .topology-visualization {
-  min-height: 150px;
   position: relative;
   margin-top: 10px;
 }
@@ -809,6 +811,7 @@ main {
   cursor: pointer;
   transition: all 0.2s ease;
   margin-bottom: 8px;
+  gap: 8px;
 }
 
 .model-group-header:hover,
@@ -837,10 +840,108 @@ main {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-grow: 1;
 }
 
 .model-count {
   font-size: 0.8em;
   color: var(--secondary-color-transparent);
   font-family: monospace;
+}
+
+/* Section header styles */
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 0;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  margin-bottom: 10px;
+}
+
+.section-header:hover {
+  opacity: 0.8;
+}
+
+.section-header i {
+  font-size: 0.9em;
+  color: var(--secondary-color-transparent);
+  transition: transform 0.2s ease;
+}
+
+.model-badge {
+  font-size: 0.8em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  display: inline-block;
+  width: fit-content;
+}
+
+.model-badge.status-success {
+  color: rgb(var(--green-color));
+  background-color: rgba(var(--green-color), 0.2);
+}
+
+.model-badge.status-info {
+  color: rgb(var(--blue-color));
+  background-color: rgba(var(--blue-color), 0.2);
+}
+
+.model-badge.status-warn {
+  color: rgb(var(--yellow-color));
+  background-color: rgba(var(--yellow-color), 0.2);
+}
+
+.model-badge.status-error {
+  color: rgb(var(--red-color));
+  background-color: rgba(var(--red-color), 0.2);
+}
+
+.model-error-message {
+  color: #fc9189;
+  font-size: 0.85em;
+}
+
+.mcp-tools-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mcp-tools-header {
+  font-weight: bold;
+  font-size: 0.9em;
+  color: var(--foreground-color);
+  margin-bottom: 4px;
+}
+
+.mcp-tool-item {
+  padding: 8px;
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  border-left: 2px solid var(--primary-color);
+}
+
+.mcp-tool-name {
+  font-weight: bold;
+  font-size: 0.9em;
+  color: var(--foreground-color);
+  margin-bottom: 4px;
+}
+
+.mcp-tool-description {
+  font-size: 0.85em;
+  color: var(--secondary-color-transparent);
+  line-height: 1.4;
+}
+
+.mcp-no-tools,
+.mcp-no-servers {
+  padding: 12px;
+  text-align: center;
+  color: var(--secondary-color-transparent);
+  font-size: 0.9em;
+  font-style: italic;
 }

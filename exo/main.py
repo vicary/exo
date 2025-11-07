@@ -164,13 +164,19 @@ node = Node(
 )
 server = GRPCServer(node, args.node_host, args.node_port)
 node.server = server
+
+# Initialize MCP manager
+from exo.mcp import MCPServerManager
+mcp_manager = MCPServerManager(topology_viz=topology_viz)
+
 api = ChatGPTAPI(
   node,
   node.inference_engine.__class__.__name__,
   response_timeout=args.chatgpt_api_response_timeout,
   on_chat_completion_request=lambda req_id, __, prompt: topology_viz.update_prompt(req_id, prompt) if topology_viz else None,
   default_model=args.default_model,
-  system_prompt=args.system_prompt
+  system_prompt=args.system_prompt,
+  mcp_manager=mcp_manager
 )
 buffered_token_output = {}
 def update_topology_viz(req_id, tokens, __):
@@ -347,6 +353,9 @@ async def main():
       loop.add_signal_handler(s, handle_exit)
 
   await node.start(wait_for_peers=args.wait_for_peers)
+  
+  # Start MCP manager in background (non-blocking)
+  asyncio.create_task(mcp_manager.start())
 
   if args.command == "run" or args.run_model:
     model_name = args.model_name or args.run_model
@@ -371,7 +380,10 @@ async def main():
 
   else:
     asyncio.create_task(api.run(port=args.chatgpt_api_port))  # Start the API server as a non-blocking task
-    await asyncio.Event().wait()
+    try:
+      await asyncio.Event().wait()
+    finally:
+      await mcp_manager.stop()
 
   if args.wait_for_peers > 0:
     print("Cooldown to allow peers to exit gracefully")
