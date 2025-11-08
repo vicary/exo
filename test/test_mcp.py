@@ -5,12 +5,64 @@ import asyncio
 import json
 import tempfile
 import os
+import sys
+import types
+import platform
+import atexit
 from pathlib import Path
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 import aiohttp
 
+# Provide lightweight stand-in for transformers to avoid heavy dependency import during tests
+if "transformers" not in sys.modules:
+    fake_transformers = types.ModuleType("transformers")
+    class _Dummy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    fake_transformers.AutoTokenizer = _Dummy
+    fake_transformers.AutoProcessor = _Dummy
+    sys.modules["transformers"] = fake_transformers
+
+# Prevent mlx import path by faking platform detection
+platform.system = lambda: "linux"
+platform.machine = lambda: "x86_64"
+
+
+class _DummyObserver:
+    def __init__(self, *args, **kwargs):
+        self.daemon = True
+
+    def schedule(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def join(self, timeout=None):
+        pass
+
+
+_observer_patch = patch("exo.mcp.manager.Observer", new=_DummyObserver)
+_observer_patch.start()
+atexit.register(_observer_patch.stop)
+
 from exo.mcp import MCPServerManager, MCPClient, MCPClientError
 from exo.mcp.transports import StdioTransport, HTTPTransport, SSETransport, TransportError
+from exo.api.chatgpt_api import (
+    ChatCompletionRequest,
+    Message,
+    generate_completion,
+    get_tool_handling_strategy,
+    execute_tool_calls,
+)
 
 
 @pytest.fixture
@@ -112,10 +164,10 @@ class TestMCPClient:
         mock_transport = AsyncMock()
         mock_transport.send_request = AsyncMock(side_effect=[
             {"protocolVersion": "2024-11-05", "capabilities": {}},
-            {},  # initialized notification
             {"tools": []}  # tools/list
         ])
         mock_transport.connect = AsyncMock()
+        mock_transport.send_notification = AsyncMock()
         
         client = MCPClient("test", mock_transport)
         await client.initialize()
@@ -123,7 +175,8 @@ class TestMCPClient:
         assert client.initialized
         assert client.name == "test"
         assert mock_transport.connect.called
-        assert mock_transport.send_request.call_count == 3
+        assert mock_transport.send_request.call_count == 2
+        assert mock_transport.send_notification.called
     
     @pytest.mark.asyncio
     async def test_mcp_client_list_tools(self):
@@ -440,7 +493,6 @@ class TestMCPServerManager:
             mock_transport.connect = AsyncMock()
             mock_transport.send_request = AsyncMock(side_effect=[
                 {"protocolVersion": "2024-11-05", "capabilities": {}},
-                {},
                 {"tools": [
                     {"name": "tool1", "description": "Tool 1"},
                     {"name": "tool2", "description": "Tool 2"}
@@ -449,7 +501,7 @@ class TestMCPServerManager:
             mock_transport_class.return_value = mock_transport
             
             await manager.start()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
             
             tools = manager.get_all_tools()
             assert len(tools) == 2
@@ -479,14 +531,13 @@ class TestMCPServerManager:
             mock_transport.connect = AsyncMock()
             mock_transport.send_request = AsyncMock(side_effect=[
                 {"protocolVersion": "2024-11-05", "capabilities": {}},
-                {},
                 {"tools": [{"name": "test_tool"}]},
                 {"result": "success"}  # tool call response
             ])
             mock_transport_class.return_value = mock_transport
             
             await manager.start()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
             
             result = await manager.call_tool("mcp_server1_test_tool", {"arg": "value"})
             assert result == {"result": "success"}
@@ -679,6 +730,176 @@ class TestMCPServerManager:
             
             await manager.stop()
 
+
+class DummyTokenizer:
+    """Simple tokenizer stub for generate_completion tests."""
+
+    def __init__(self, decoded: str):
+        self._decoded = decoded
+
+    def decode(self, tokens):
+        return self._decoded
+
+    def encode(self, prompt):
+        # Return deterministic token ids
+        return list(range(len(prompt)))
+
+
+class TestToolStreamingFormat:
+    """Tests for tool call streaming chunk generation."""
+
+    def test_generate_completion_includes_tool_calls(self):
+        decoded = (
+            "Here are the details before tool call.\n"
+            "<tool_call>{\"name\": \"my_tool\", \"arguments\": {\"foo\": \"bar\"}}</tool_call>"
+        )
+        tokenizer = DummyTokenizer(decoded)
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message("user", "hello")],
+            temperature=0.0,
+        )
+        # Pretend we have an MCP manager so tool parsing runs
+        chat_request.mcp_manager = object()
+
+        completion = generate_completion(
+            chat_request=chat_request,
+            tokenizer=tokenizer,
+            prompt="prompt",
+            request_id="req123",
+            tokens=[1, 2, 3],
+            stream=True,
+            finish_reason=None,
+            object_type="chat.completion",
+        )
+
+        choice = completion["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        delta = choice["delta"]
+        assert delta["content"].strip().startswith("Here are the details")
+        tool_calls = delta["tool_calls"]
+        assert len(tool_calls) == 1
+        tool_call = tool_calls[0]
+        assert tool_call["type"] == "function"
+        assert tool_call["function"]["name"] == "my_tool"
+        assert tool_call["function"]["arguments"] == '{"foo": "bar"}'
+
+    def test_generate_completion_respects_include_flag(self):
+        decoded = "<tool_call>{\"name\": \"another\", \"arguments\": {}}</tool_call>"
+        tokenizer = DummyTokenizer(decoded)
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message("user", "hello")],
+            temperature=0.0,
+        )
+        chat_request.mcp_manager = object()
+
+        completion = generate_completion(
+            chat_request=chat_request,
+            tokenizer=tokenizer,
+            prompt="prompt",
+            request_id="req123",
+            tokens=[1, 2, 3],
+            stream=True,
+            finish_reason=None,
+            object_type="chat.completion",
+            include_tool_calls=False,
+        )
+
+        delta = completion["choices"][0]["delta"]
+        assert "tool_calls" not in delta
+
+
+class DummyMCPManager:
+    """Lightweight MCP manager stub for execute_tool_calls tests."""
+
+    def __init__(self, result=None, raise_error=False):
+        self.clients = {"server": object()}
+        self._result = result or {"status": "ok"}
+        self._raise_error = raise_error
+        self.calls = []
+
+    async def call_tool(self, tool_name, arguments):
+        self.calls.append((tool_name, arguments))
+        if self._raise_error:
+            raise MCPClientError("call failed")
+        return self._result
+
+    def get_all_tools(self):
+        return [
+            {
+                "name": "mcp_server_test",
+                "description": "Test tool",
+                "inputSchema": {},
+            }
+        ]
+
+
+class TestToolHandling:
+    """Edge-case tests for MCP tool selection and execution."""
+
+    def test_get_tool_handling_unknown_tool(self):
+        tool_calls = [{"function": {"name": "unknown_tool", "arguments": "{}"}}]
+        strategy, mcp_calls = get_tool_handling_strategy(tool_calls, None, None)
+        assert strategy == "error"
+        assert mcp_calls == []
+
+    def test_get_tool_handling_client_side(self):
+        tool_calls = [{"function": {"name": "client_tool", "arguments": "{}"}}]
+        client_tools = [
+            {
+                "type": "function",
+                "function": {"name": "client_tool", "parameters": {}},
+            }
+        ]
+        strategy, mcp_calls = get_tool_handling_strategy(tool_calls, client_tools, None)
+        assert strategy == "client_side"
+        assert mcp_calls == []
+
+    def test_get_tool_handling_server_side(self):
+        tool_calls = [{"function": {"name": "mcp_server_test", "arguments": "{}"}}]
+        manager = DummyMCPManager()
+        strategy, mcp_calls = get_tool_handling_strategy(tool_calls, None, manager)
+        assert strategy == "server_side"
+        assert len(mcp_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_calls_invalid_arguments(self):
+        manager = DummyMCPManager(result={"result": "success"})
+        tool_calls = [
+            {
+                "id": "call1",
+                "function": {
+                    "name": "mcp_server_test",
+                    "arguments": "{invalid json",
+                },
+            }
+        ]
+
+        results = await execute_tool_calls(tool_calls, manager, node=None)
+        assert len(results) == 1
+        # Should fall back to empty dict arguments
+        assert manager.calls[0][1] == {}
+        assert json.loads(results[0]["content"]) == {"result": "success"}
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_calls_handles_errors(self):
+        manager = DummyMCPManager(raise_error=True)
+        tool_calls = [
+            {
+                "id": "call1",
+                "function": {
+                    "name": "mcp_server_test",
+                    "arguments": "{}",
+                },
+            }
+        ]
+
+        results = await execute_tool_calls(tool_calls, manager, node=None)
+        assert len(results) == 1
+        payload = json.loads(results[0]["content"])
+        assert "error" in payload
+        assert "call failed" in payload["error"]
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

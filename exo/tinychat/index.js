@@ -476,8 +476,9 @@ document.addEventListener("alpine:init", () => {
               
               // Check if this is the "Executing" message - if so, output buffered tool calls with collapsible
               if (content.includes('Executing') && content.includes('tool') && toolCallsBuffer.length > 0) {
-                // Create collapsible section
-                let toolCallsHtml = '\n\n<details open>\n<summary><strong>' + content.trim() + '</strong></summary>\n\n';
+                // Remove escape backslashes (e.g., "(s\)" -> "(s)")
+                // Create collapsible section - let markdown parse the summary content
+                let toolCallsHtml = '\n\n<details open>\n<summary>' + content.trim().replace(/\\([()])/g, '$1') + '</summary>\n\n';
                 
                 for (const tool of toolCallsBuffer) {
                   toolCallsHtml += `**Tool:** \`${tool.name}\`\n\`\`\`json\n${tool.args}\n\`\`\`\n\n`;
@@ -485,11 +486,12 @@ document.addEventListener("alpine:init", () => {
                 
                 toolCallsHtml += '</details>\n\n';
                 
-                yield toolCallsHtml;
                 toolCallsBuffer = [];
+                yield toolCallsHtml;
                 inToolCallSection = false;
               } else {
-                yield content;
+                // Remove escape backslashes from regular content
+                yield content.replace(/\\([()])/g, '$1');
               }
             }
           }

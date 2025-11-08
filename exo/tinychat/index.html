@@ -516,6 +516,15 @@
         }
       );
 
+      // Parse markdown inside <summary> tags
+      text = text.replace(
+        /<summary>([\s\S]*?)<\/summary>/g,
+        (match, body) => {
+          const parsedBody = DOMPurify.sanitize(marked.parse(body.trim()));
+          return `<summary>${parsedBody}</summary>`;
+        }
+      );
+
       // Add backslashes to parentheses and brackets for LaTeX
       text = text
         .replace(/\((?=\s*[\d\\])/g, '\\(')  // Add backslash before opening parentheses
